@@ -42,13 +42,21 @@ function segmentImage(canvas) {
   const threshold = learnedThreshold || 200;
   console.log(`segmentation threshold: ${threshold}${learnedThreshold ? ' (learned)' : ' (default)'}`);
 
+  const SAT_THRESHOLD = 0.15; // recover bright-but-colorful pixels (yellow, tan)
   const mask = new Uint8Array(totalPixels);
   for (let i = 0; i < totalPixels; i++) {
     const r = data[i * 4];
     const g = data[i * 4 + 1];
     const b = data[i * 4 + 2];
     const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
-    mask[i] = brightness < threshold ? 1 : 0;
+    if (brightness < threshold) {
+      mask[i] = 1;
+    } else {
+      // Bright pixel — check if it's colorful (saturated) rather than white background
+      const mx = Math.max(r, g, b);
+      const sat = mx > 0 ? (mx - Math.min(r, g, b)) / mx : 0;
+      mask[i] = sat > SAT_THRESHOLD ? 1 : 0;
+    }
   }
 
   // Connected components via BFS
@@ -63,6 +71,9 @@ function segmentImage(canvas) {
     let minX = width, minY = height, maxX = 0, maxY = 0;
     let pixelCount = 0;
     let totalR = 0, totalG = 0, totalB = 0;
+    const histR = new Float64Array(16);
+    const histG = new Float64Array(16);
+    const histB = new Float64Array(16);
     const queue = [i];
     labels[i] = label;
 
@@ -76,9 +87,13 @@ function segmentImage(canvas) {
       if (y < minY) minY = y;
       if (y > maxY) maxY = y;
       pixelCount++;
-      totalR += data[idx * 4];
-      totalG += data[idx * 4 + 1];
-      totalB += data[idx * 4 + 2];
+      const pr = data[idx * 4], pg = data[idx * 4 + 1], pb = data[idx * 4 + 2];
+      totalR += pr;
+      totalG += pg;
+      totalB += pb;
+      histR[Math.min(15, pr >> 4)]++;
+      histG[Math.min(15, pg >> 4)]++;
+      histB[Math.min(15, pb >> 4)]++;
 
       const neighbors = [];
       if (x > 0) neighbors.push(idx - 1);
@@ -99,6 +114,9 @@ function segmentImage(canvas) {
       avgR: Math.round(totalR / pixelCount),
       avgG: Math.round(totalG / pixelCount),
       avgB: Math.round(totalB / pixelCount),
+      histR: Array.from(histR),
+      histG: Array.from(histG),
+      histB: Array.from(histB),
     });
   }
 
@@ -110,9 +128,31 @@ function segmentImage(canvas) {
     .sort((a, b) => b.pixelCount - a.pixelCount);
 }
 
-// Color distance (simple Euclidean in RGB)
+// Perceptually weighted color distance (redmean approximation)
 function colorDist(r1, g1, b1, r2, g2, b2) {
-  return Math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2);
+  const rmean = (r1 + r2) / 2;
+  const dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
+  return Math.sqrt((2 + rmean / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rmean) / 256) * db * db);
+}
+
+// Histogram distance: L2 between normalized distributions
+function histDist(h1, h2) {
+  const s1 = h1.reduce((a, b) => a + b, 0) || 1;
+  const s2 = h2.reduce((a, b) => a + b, 0) || 1;
+  let d = 0;
+  for (let i = 0; i < h1.length; i++) {
+    const diff = h1[i] / s1 - h2[i] / s2;
+    d += diff * diff;
+  }
+  return Math.sqrt(d);
+}
+
+// Combined RGB histogram distance
+function colorHistDist(blob, learnedHist) {
+  if (!blob.histR || !learnedHist.histR) return Infinity;
+  return histDist(blob.histR, learnedHist.histR) +
+         histDist(blob.histG, learnedHist.histG) +
+         histDist(blob.histB, learnedHist.histB);
 }
 
 function hexToRGB(hex) {
@@ -145,6 +185,7 @@ async function apiSaveSession() {
   const stripBlob = (b) => ({
     minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY,
     avgR: b.avgR, avgG: b.avgG, avgB: b.avgB,
+    histR: b.histR, histG: b.histG, histB: b.histB,
     source: b.source || 'auto',
     partKey: b.partKey, partName: b.partName,
   });
@@ -171,12 +212,12 @@ async function apiSaveSession() {
   }
 }
 
-async function apiLabel(setNum, partNum, colorId, jpegB64, avgR, avgG, avgB) {
+async function apiLabel(setNum, partNum, colorId, jpegB64, avgR, avgG, avgB, histR, histG, histB) {
   try {
     const res = await fetch('api/label', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ setNum, partNum, colorId: String(colorId), jpeg: jpegB64, avgR, avgG, avgB }),
+      body: JSON.stringify({ setNum, partNum, colorId: String(colorId), jpeg: jpegB64, avgR, avgG, avgB, histR, histG, histB }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -188,6 +229,18 @@ async function apiLabel(setNum, partNum, colorId, jpegB64, avgR, avgG, avgB) {
     else console.warn('learn error:', data.error);
   } catch (e) {
     console.warn('learn send failed:', e);
+  }
+}
+
+async function apiReject(setNum, wrongKey, jpegB64) {
+  try {
+    await fetch('api/reject', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ setNum, wrongKey, jpeg: jpegB64 }),
+    });
+  } catch (e) {
+    console.warn('reject send failed:', e);
   }
 }
 
@@ -203,10 +256,36 @@ async function apiSuggest(setNum, jpegB64) {
       suggestions: data.suggestions || [],
       learnedColors: data.learnedColors || {},
       cropCount: data.cropCount || 0,
+      threshold: data.threshold || null,
+      colorProbs: data.colorProbs || {},
     };
   } catch (e) {
     console.warn('suggest failed:', e);
-    return { suggestions: [], learnedColors: {}, cropCount: 0 };
+    return { suggestions: [], learnedColors: {}, cropCount: 0, colorProbs: {} };
+  }
+}
+
+async function bootstrapCatalog() {
+  const setNum = window.lostbricks.getCurrentSetNum();
+  if (!setNum) return;
+  const parts = window.lostbricks.getCurrentSetParts();
+  if (!parts.length) return;
+  const payload = parts.map(p => ({
+    key: `${p.partNum}_${p.color.id}`,
+    imgUrl: p.imgUrl,
+  })).filter(p => p.imgUrl);
+  try {
+    const res = await fetch('api/bootstrap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ setNum, parts: payload }),
+    });
+    const data = await res.json();
+    if (data.downloading) {
+      console.log(`bootstrap: downloading ${data.downloading} catalog images`);
+    }
+  } catch (e) {
+    console.warn('bootstrap failed:', e);
   }
 }
 
@@ -273,6 +352,7 @@ let blobs = []; // { minX, minY, maxX, maxY, avgR, avgG, avgB, partKey, partName
 let deletedBlobs = []; // blobs the user explicitly removed
 let capturedCanvas = null; // cropped frame
 let selectedBlobIdx = null;
+let pickerApplyAll = false; // when true, assignPart labels ALL blobs
 
 function openScan() {
   document.getElementById('scan-modal').classList.remove('hidden');
@@ -284,7 +364,9 @@ function openScan() {
   deletedBlobs = [];
   selectedBlobIdx = null;
   capturedCanvas = null;
+  clearFloatingLabels();
   fetchLearnedParams(); // get latest threshold + colors from server
+  bootstrapCatalog(); // ensure catalog images are in the index
   startCamera();
 }
 
@@ -302,6 +384,7 @@ function showAnnotated(detected) {
   document.getElementById('scan-annotate').classList.remove('hidden');
   updateStatus();
   drawAnnotatedPhoto();
+  updateFloatingLabels();
 }
 
 function updateStatus() {
@@ -332,12 +415,22 @@ function drawAnnotatedPhoto() {
       ctx.strokeStyle = '#2ecc71';
       ctx.lineWidth = 4;
       ctx.strokeRect(x, y, w, h);
-      // Label text
-      ctx.font = 'bold 24px sans-serif';
-      ctx.fillStyle = '#2ecc71';
-      ctx.fillRect(x, y - 28, Math.min(ctx.measureText(blob.partName).width + 8, w), 28);
-      ctx.fillStyle = '#000';
-      ctx.fillText(blob.partName, x + 4, y - 6, w - 8);
+      // Leader line to floating label
+      if (blob.labelOffX !== undefined) {
+        const bcx = (blob.minX + blob.maxX) / 2;
+        const bcy = (blob.minY + blob.maxY) / 2;
+        const lx = bcx + blob.labelOffX;
+        const ly = bcy + blob.labelOffY;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(46, 204, 113, 0.5)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(bcx, bcy);
+        ctx.lineTo(lx, ly);
+        ctx.stroke();
+        ctx.restore();
+      }
     } else if (i === selectedBlobIdx) {
       // Selected — accent
       ctx.strokeStyle = '#e94560';
@@ -456,19 +549,28 @@ function canvasPointerUp(e) {
     return;
   }
 
-  // Sample average color from foreground pixels only
+  // Sample average color + histograms from foreground pixels only
   const ctx = capturedCanvas.getContext('2d');
   const imageData = ctx.getImageData(Math.round(x1), Math.round(y1), Math.round(w), Math.round(h));
   const data = imageData.data;
   const totalPx = data.length / 4;
   let totalR = 0, totalG = 0, totalB = 0, fgCount = 0;
+  const mHistR = new Float64Array(16);
+  const mHistG = new Float64Array(16);
+  const mHistB = new Float64Array(16);
+  const manualThresh = learnedThreshold || 200;
   for (let i = 0; i < totalPx; i++) {
     const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
     const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
-    if (brightness < (learnedThreshold || 200)) {
+    const mx = Math.max(r, g, b);
+    const sat = mx > 0 ? (mx - Math.min(r, g, b)) / mx : 0;
+    if (brightness < manualThresh || sat > 0.15) {
       totalR += r;
       totalG += g;
       totalB += b;
+      mHistR[Math.min(15, r >> 4)]++;
+      mHistG[Math.min(15, g >> 4)]++;
+      mHistB[Math.min(15, b >> 4)]++;
       fgCount++;
     }
   }
@@ -482,13 +584,15 @@ function canvasPointerUp(e) {
     avgR: Math.round(totalR / fgCount),
     avgG: Math.round(totalG / fgCount),
     avgB: Math.round(totalB / fgCount),
+    histR: Array.from(mHistR),
+    histG: Array.from(mHistG),
+    histB: Array.from(mHistB),
     partKey: null, partName: null, source: 'manual',
   };
   blobs.push(newBlob);
-  selectedBlobIdx = blobs.length - 1;
+  selectedBlobIdx = null; // don't auto-select; user taps when ready
   updateStatus();
   drawAnnotatedPhoto();
-  showPartPicker(newBlob);
 }
 
 const scanCanvas = document.getElementById('scan-canvas');
@@ -535,7 +639,7 @@ function buildColorChips() {
   });
 }
 
-function showPartPicker(blob) {
+function showPartPicker(blob, allowAutoAssign = false) {
   pickerColorFilter = null; // reset for each new blob
   pickerBlob = blob;
   const parts = window.lostbricks.getCurrentSetParts();
@@ -559,24 +663,51 @@ function showPartPicker(blob) {
     blobImg.src = '';
   }
 
+  // Compute color priors from remaining parts in this set
+  // P(color) = fraction of remaining pieces that are this color
+  const colorRemaining = {};
+  let totalRemaining = 0;
+  for (const p of pickerParts) {
+    const cid = String(p.color.id);
+    const have = window.lostbricks.getHave(`${p.partNum}_${p.color.id}`);
+    const rem = Math.max(0, p.qty - have);
+    colorRemaining[cid] = (colorRemaining[cid] || 0) + rem;
+    totalRemaining += rem;
+  }
+  const colorPrior = {};
+  for (const [cid, count] of Object.entries(colorRemaining)) {
+    colorPrior[cid] = totalRemaining > 0 ? count / totalRemaining : 0;
+  }
+
   // Score by color distance + remaining need
-  // Use learned photographed colors when available, fall back to catalog
+  // Use histogram distance when available, fall back to avg RGB distance
   if (blob) {
     const { avgR, avgG, avgB } = blob;
+    const hasHist = blob.histR && blob.histR.length === 16;
     pickerParts = pickerParts.map((p) => {
       const key = `${p.partNum}_${p.color.id}`;
       const lc = learnedColors[String(p.color.id)];
-      let pr, pg, pb;
-      if (lc && lc.count >= 2) {
-        // Use learned photographed color (more accurate than catalog)
-        pr = lc.r; pg = lc.g; pb = lc.b;
+      let colorScore, dist;
+
+      if (hasHist && lc && lc.histR) {
+        // Histogram distance (captures distribution shape, resistant to outliers)
+        dist = colorHistDist(blob, lc);
+        colorScore = dist * 200; // scale to comparable range with old colorDist
+      } else if (lc && lc.count >= 1) {
+        // Fall back to avg RGB distance with learned colors
+        dist = colorDist(avgR, avgG, avgB, lc.r, lc.g, lc.b);
+        colorScore = dist;
+        if (dist < 60) colorScore = dist * 0.3; // close colors: let ML decide
       } else {
-        [pr, pg, pb] = hexToRGB(p.color.rgb);
+        // Fall back to catalog colors (unreliable)
+        const [pr, pg, pb] = hexToRGB(p.color.rgb);
+        dist = colorDist(avgR, avgG, avgB, pr, pg, pb);
+        colorScore = dist * 0.3;
       }
-      const dist = colorDist(avgR, avgG, avgB, pr, pg, pb);
+
       const have = window.lostbricks.getHave(key);
       const remaining = Math.max(0, p.qty - have);
-      const score = dist - remaining * 2;
+      const score = colorScore - remaining * 10;
       return { ...p, dist, remaining, score, mlBoost: 0 };
     }).sort((a, b) => a.score - b.score);
   }
@@ -602,10 +733,10 @@ function showPartPicker(blob) {
         return;
       }
 
-      // Apply ML boost to matching parts
+      // Apply ML boost to matching parts (decays with rank, always positive)
       const boostMap = new Map();
       suggestions.forEach((s, i) => {
-        boostMap.set(s.key, 100 - i * 8);
+        boostMap.set(s.key, 100 / (1 + i * 0.5));
       });
       for (const p of pickerParts) {
         const key = `${p.partNum}_${p.color.id}`;
@@ -615,33 +746,69 @@ function showPartPicker(blob) {
           p.score -= boost;
         }
       }
-      pickerParts.sort((a, b) => a.score - b.score);
 
-      // Re-score with learned colors (now that we have fresh data)
-      if (lc && blob) {
+      // Apply SVM color probability × set prior (Bayesian posterior)
+      const colorProbs = result.colorProbs;
+      if (colorProbs && Object.keys(colorProbs).length > 0) {
+        // Compute posterior: P(color|blob) ∝ P(blob|color) × P(color_in_set)
+        let posteriorSum = 0;
+        const posteriors = {};
+        for (const cid of Object.keys(colorProbs)) {
+          const likelihood = colorProbs[cid];
+          const prior = colorPrior[cid] || 0.001; // small floor for unseen colors
+          posteriors[cid] = likelihood * prior;
+          posteriorSum += posteriors[cid];
+        }
+        // Normalize
+        if (posteriorSum > 0) {
+          for (const cid of Object.keys(posteriors)) {
+            posteriors[cid] /= posteriorSum;
+          }
+        }
+        for (const p of pickerParts) {
+          const cid = String(p.color.id);
+          const posterior = posteriors[cid] || 0;
+          p.colorProb = posterior;
+          p.score -= posterior * 150;
+        }
+      } else if (lc && blob) {
+        // Fallback: re-score with learned color averages
         const { avgR, avgG, avgB } = blob;
         for (const p of pickerParts) {
           const lcEntry = lc[String(p.color.id)];
-          if (lcEntry && lcEntry.count >= 2) {
+          if (lcEntry && lcEntry.count >= 1) {
             p.dist = colorDist(avgR, avgG, avgB, lcEntry.r, lcEntry.g, lcEntry.b);
           }
         }
       }
+      pickerParts.sort((a, b) => a.score - b.score);
 
-      // If top suggestion is very confident, auto-select its color tab
+      // If top suggestion is very confident, auto-assign (only when not user-initiated)
       const topDist = suggestions[0].dist;
-      if (topDist < 0.3 && suggestions.length >= 1) {
-        const topKey = suggestions[0].key;
-        const topPart = pickerParts.find((p) => `${p.partNum}_${p.color.id}` === topKey);
-        if (topPart) {
-          pickerColorFilter = topPart.color.id;
-        }
+      const secondDist = suggestions.length > 1 ? suggestions[1].dist : 999;
+      const gap = secondDist - topDist;
+      const topKey = suggestions[0].key;
+      const topPart = pickerParts.find((p) => `${p.partNum}_${p.color.id}` === topKey);
+
+      if (allowAutoAssign && topDist < 0.3 && gap > 0.15 && topPart && selectedBlobIdx !== null && !blob.partKey) {
+        console.log(`AUTO: ${topKey} (d=${topDist}, gap=${gap.toFixed(3)})`);
+        blob.autoAssignedKey = topKey; // track for rejection learning
+        assignPart(topKey, topPart.name);
+        return;
+      }
+
+      // Otherwise just auto-select the color tab for the best match
+      if (topDist < 0.5 && topPart) {
+        pickerColorFilter = topPart.color.id;
       }
 
       buildColorChips();
       renderPickerGrid();
       updatePickerTitle();
-      console.log(`ML: ${cropCount} crops, top=${suggestions[0].key} (d=${suggestions[0].dist})`);
+      const topColorId = topKey.split('_')[1];
+      const svmP = colorProbs ? (colorProbs[topColorId] || 0).toFixed(2) : '?';
+      const postP = topPart ? (topPart.colorProb || 0).toFixed(2) : '?';
+      console.log(`ML: ${cropCount} crops, top=${topKey} (d=${topDist}, gap=${gap.toFixed(3)}, svm=${svmP}, post=${postP})`);
     });
   }
 
@@ -669,7 +836,7 @@ function renderPickerGrid() {
   grid.innerHTML = filtered.map((p, i) => {
     const key = `${p.partNum}_${p.color.id}`;
     const remaining = p.remaining !== undefined ? p.remaining : '';
-    const isTopML = p.mlBoost > 80;
+    const isTopML = p.mlBoost > 50;
     const cls = `picker-item${isTopML ? ' ml-top' : ''}`;
     return `
       <div class="${cls}" data-key="${key}" data-name="${p.name}">
@@ -691,39 +858,316 @@ function hidePartPicker() {
 }
 
 async function assignPart(key, name) {
-  if (selectedBlobIdx === null) return;
+  if (selectedBlobIdx === null && !pickerApplyAll) return;
 
-  const blob = blobs[selectedBlobIdx];
-  blob.partKey = key;
-  blob.partName = name;
-
-  window.lostbricks.incrementPart(key);
-
-  // Store crop locally + send to learning server
+  const targetBlobs = pickerApplyAll ? blobs : [blobs[selectedBlobIdx]];
+  const setNum = window.lostbricks.getCurrentSetNum();
   const [partNum, colorId] = key.split('_');
-  const jpegB64 = blobToBase64(blob);
 
-  // Send to server (fire-and-forget)
-  apiLabel(window.lostbricks.getCurrentSetNum(), partNum, colorId, jpegB64, blob.avgR, blob.avgG, blob.avgB);
+  for (const blob of targetBlobs) {
+    // Learn from rejected auto-assign
+    if (blob.autoAssignedKey && blob.autoAssignedKey !== key) {
+      console.log(`REJECT auto: ${blob.autoAssignedKey} → ${key}`);
+      apiReject(setNum, blob.autoAssignedKey, blobToBase64(blob));
+    }
+    blob.autoAssignedKey = null;
 
-  // Also store in IndexedDB
-  try {
-    const jpeg = await fetch(`data:image/jpeg;base64,${jpegB64}`).then((r) => r.blob());
-    await storeCrop(window.lostbricks.getCurrentSetNum(), partNum, parseInt(colorId), jpeg);
-  } catch (e) {
-    console.warn('Failed to store crop:', e);
+    // Just update the blob label — counts are applied in batch on "Done"
+    blob.partKey = key;
+    blob.partName = name;
+
+    // Send crop to learning server (fire-and-forget)
+    const jpegB64 = blobToBase64(blob);
+    apiLabel(setNum, partNum, colorId, jpegB64, blob.avgR, blob.avgG, blob.avgB, blob.histR, blob.histG, blob.histB);
+
+    // Also store in IndexedDB
+    try {
+      const jpeg = await fetch(`data:image/jpeg;base64,${jpegB64}`).then((r) => r.blob());
+      await storeCrop(setNum, partNum, parseInt(colorId), jpeg);
+    } catch (e) {
+      console.warn('Failed to store crop:', e);
+    }
   }
 
+  pickerApplyAll = false;
   hidePartPicker();
   selectedBlobIdx = null;
   updateStatus();
+  initLabelPositions();
   drawAnnotatedPhoto();
+  updateFloatingLabels();
+}
+
+// ── Floating Labels ──
+
+function getPartImgUrl(partKey) {
+  const parts = window.lostbricks.getCurrentSetParts();
+  const [partNum, colorId] = partKey.split('_');
+  const part = parts.find(p => p.partNum === partNum && String(p.color.id) === colorId);
+  return part ? part.imgUrl || '' : '';
+}
+
+function canvasToWrapCSS(cx, cy) {
+  const canvas = document.getElementById('scan-canvas');
+  const wrap = document.getElementById('scan-photo-wrap');
+  const cRect = canvas.getBoundingClientRect();
+  const wRect = wrap.getBoundingClientRect();
+  return {
+    x: (cRect.left - wRect.left) + cx * (cRect.width / canvas.width),
+    y: (cRect.top - wRect.top) + cy * (cRect.height / canvas.height),
+  };
+}
+
+const LABEL_EST_W = 140; // CSS px estimates for overlap avoidance
+const LABEL_EST_H = 46;
+
+function initLabelPositions() {
+  const canvas = document.getElementById('scan-canvas');
+  const cRect = canvas.getBoundingClientRect();
+  if (!cRect.width) return;
+  const sx = cRect.width / canvas.width;
+  const sy = cRect.height / canvas.height;
+
+  // Set initial offset for newly labeled blobs
+  for (const blob of blobs) {
+    if (blob.partKey && blob.labelOffX === undefined) {
+      blob.labelOffX = 0;
+      blob.labelOffY = -((blob.maxY - blob.minY) / 2 + LABEL_EST_H / sy + 10);
+    }
+  }
+
+  // Overlap avoidance — push labels away from other blobs AND other labels
+  const labeled = blobs.filter(b => b.partKey && b.labelOffX !== undefined);
+  const labelHalfW = (LABEL_EST_W / 2) / sx; // half-size in canvas coords
+  const labelHalfH = (LABEL_EST_H / 2) / sy;
+  const blobPad = 8;
+
+  for (let iter = 0; iter < 15; iter++) {
+    let moved = false;
+
+    // Push labels away from OTHER blobs (most important)
+    for (const a of labeled) {
+      const acx = (a.minX + a.maxX) / 2 + a.labelOffX;
+      const acy = (a.minY + a.maxY) / 2 + a.labelOffY;
+
+      for (const b of blobs) {
+        if (b === a) continue; // overlapping own blob is OK
+        const bx1 = b.minX - blobPad, by1 = b.minY - blobPad;
+        const bx2 = b.maxX + blobPad, by2 = b.maxY + blobPad;
+        const lx1 = acx - labelHalfW, ly1 = acy - labelHalfH;
+        const lx2 = acx + labelHalfW, ly2 = acy + labelHalfH;
+
+        if (lx1 < bx2 && lx2 > bx1 && ly1 < by2 && ly2 > by1) {
+          // Push label away from blob center
+          const bcx = (b.minX + b.maxX) / 2;
+          const bcy = (b.minY + b.maxY) / 2;
+          let dx = acx - bcx || 0.1;
+          let dy = acy - bcy || -1;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const push = Math.min(
+            Math.min(lx2 - bx1, bx2 - lx1),
+            Math.min(ly2 - by1, by2 - ly1)
+          ) + 10;
+          a.labelOffX += (dx / dist) * push;
+          a.labelOffY += (dy / dist) * push;
+          moved = true;
+        }
+      }
+    }
+
+    // Push labels away from each other
+    for (let i = 0; i < labeled.length; i++) {
+      for (let j = i + 1; j < labeled.length; j++) {
+        const a = labeled[i], b = labeled[j];
+        const ax = ((a.minX + a.maxX) / 2 + a.labelOffX) * sx;
+        const ay = ((a.minY + a.maxY) / 2 + a.labelOffY) * sy;
+        const bx = ((b.minX + b.maxX) / 2 + b.labelOffX) * sx;
+        const by = ((b.minY + b.maxY) / 2 + b.labelOffY) * sy;
+
+        const overlapX = LABEL_EST_W - Math.abs(ax - bx);
+        const overlapY = LABEL_EST_H - Math.abs(ay - by);
+
+        if (overlapX > 0 && overlapY > 0) {
+          if (overlapX < overlapY) {
+            const push = (overlapX / 2 + 4) / sx;
+            if (ax <= bx) { a.labelOffX -= push; b.labelOffX += push; }
+            else { a.labelOffX += push; b.labelOffX -= push; }
+          } else {
+            const push = (overlapY / 2 + 4) / sy;
+            if (ay <= by) { a.labelOffY -= push; b.labelOffY += push; }
+            else { a.labelOffY += push; b.labelOffY -= push; }
+          }
+          moved = true;
+        }
+      }
+    }
+
+    if (!moved) break;
+  }
+}
+
+function clearFloatingLabels() {
+  document.getElementById('scan-photo-wrap').querySelectorAll('.blob-label').forEach(el => el.remove());
+}
+
+let labelDragInfo = null;
+
+function updateFloatingLabels() {
+  const wrap = document.getElementById('scan-photo-wrap');
+  clearFloatingLabels();
+
+  for (let i = 0; i < blobs.length; i++) {
+    const blob = blobs[i];
+    if (!blob.partKey || blob.labelOffX === undefined) continue;
+
+    const cx = (blob.minX + blob.maxX) / 2;
+    const cy = (blob.minY + blob.maxY) / 2;
+    const pos = canvasToWrapCSS(cx + blob.labelOffX, cy + blob.labelOffY);
+
+    const el = document.createElement('div');
+    el.className = 'blob-label';
+    el.style.left = pos.x + 'px';
+    el.style.top = pos.y + 'px';
+    el.dataset.blobIdx = i;
+
+    const img = document.createElement('img');
+    img.src = getPartImgUrl(blob.partKey);
+    img.alt = '';
+    el.appendChild(img);
+
+    const span = document.createElement('span');
+    span.textContent = blob.partName;
+    el.appendChild(span);
+
+    wrap.appendChild(el);
+
+    // Drag + tap handling
+    el.addEventListener('pointerdown', labelPointerDown);
+    el.addEventListener('pointermove', labelPointerMove);
+    el.addEventListener('pointerup', labelPointerUp);
+  }
+}
+
+function labelPointerDown(e) {
+  e.stopPropagation();
+  e.preventDefault();
+  const el = e.currentTarget;
+  el.setPointerCapture(e.pointerId);
+  labelDragInfo = {
+    el,
+    blobIdx: parseInt(el.dataset.blobIdx),
+    startX: e.clientX, startY: e.clientY,
+    lastX: e.clientX, lastY: e.clientY,
+    moved: false,
+  };
+}
+
+function labelPointerMove(e) {
+  if (!labelDragInfo) return;
+  e.preventDefault();
+  const dx = e.clientX - labelDragInfo.lastX;
+  const dy = e.clientY - labelDragInfo.lastY;
+
+  if (Math.abs(e.clientX - labelDragInfo.startX) > 5 ||
+      Math.abs(e.clientY - labelDragInfo.startY) > 5) {
+    labelDragInfo.moved = true;
+  }
+  if (!labelDragInfo.moved) return;
+
+  labelDragInfo.lastX = e.clientX;
+  labelDragInfo.lastY = e.clientY;
+  labelDragInfo.el.classList.add('dragging');
+
+  const blob = blobs[labelDragInfo.blobIdx];
+  const canvas = document.getElementById('scan-canvas');
+  const cRect = canvas.getBoundingClientRect();
+  blob.labelOffX += dx * (canvas.width / cRect.width);
+  blob.labelOffY += dy * (canvas.height / cRect.height);
+
+  const cx = (blob.minX + blob.maxX) / 2;
+  const cy = (blob.minY + blob.maxY) / 2;
+  const pos = canvasToWrapCSS(cx + blob.labelOffX, cy + blob.labelOffY);
+  labelDragInfo.el.style.left = pos.x + 'px';
+  labelDragInfo.el.style.top = pos.y + 'px';
+
+  drawAnnotatedPhoto();
+}
+
+function labelPointerUp(e) {
+  if (!labelDragInfo) return;
+  const info = labelDragInfo;
+  labelDragInfo = null;
+  info.el.classList.remove('dragging');
+
+  if (!info.moved) {
+    // Tap on label — select blob and open picker
+    selectedBlobIdx = info.blobIdx;
+    drawAnnotatedPhoto();
+    updateFloatingLabels();
+    showPartPicker(blobs[info.blobIdx]);
+  }
 }
 
 // ── Event Listeners ──
 
 document.getElementById('scan-btn').addEventListener('click', openScan);
 document.getElementById('scan-close').addEventListener('click', closeScan);
+
+document.getElementById('scan-all-same').addEventListener('click', () => {
+  if (blobs.length === 0) return;
+  pickerApplyAll = true;
+  // Use first unlabeled blob for color reference, fall back to first blob
+  const refBlob = blobs.find((b) => !b.partKey) || blobs[0];
+  selectedBlobIdx = blobs.indexOf(refBlob);
+  drawAnnotatedPhoto();
+  showPartPicker(refBlob);
+});
+
+document.getElementById('scan-guess-all').addEventListener('click', async () => {
+  if (blobs.length === 0) return;
+  const setNum = window.lostbricks.getCurrentSetNum();
+  const parts = window.lostbricks.getCurrentSetParts();
+  const partMap = new Map();
+  for (const p of parts) partMap.set(`${p.partNum}_${p.color.id}`, p.name);
+
+  let guessed = 0;
+  for (let i = 0; i < blobs.length; i++) {
+    const blob = blobs[i];
+    if (blob.partKey) continue; // skip already labeled
+    const jpegB64 = blobToBase64(blob);
+    const result = await apiSuggest(setNum, jpegB64);
+    if (result.suggestions.length > 0) {
+      const top = result.suggestions[0];
+      blob.partKey = top.key;
+      blob.partName = partMap.get(top.key) || top.key;
+      blob.autoAssignedKey = top.key;
+      // Send to learning server
+      const [partNum, colorId] = top.key.split('_');
+      apiLabel(setNum, partNum, colorId, jpegB64, blob.avgR, blob.avgG, blob.avgB, blob.histR, blob.histG, blob.histB);
+      guessed++;
+    }
+  }
+  if (guessed) {
+    initLabelPositions();
+    updateStatus();
+    drawAnnotatedPhoto();
+    updateFloatingLabels();
+    console.log(`guessed ${guessed} blobs`);
+  }
+});
+
+document.getElementById('scan-clear-all').addEventListener('click', () => {
+  for (const blob of blobs) {
+    blob.partKey = null;
+    blob.partName = null;
+    blob.autoAssignedKey = null;
+    blob.labelOffX = undefined;
+    blob.labelOffY = undefined;
+  }
+  clearFloatingLabels();
+  updateStatus();
+  drawAnnotatedPhoto();
+});
 
 // ── Crop Phase ──
 
@@ -911,10 +1355,17 @@ document.getElementById('scan-retake').addEventListener('click', () => {
   document.getElementById('part-picker').classList.add('hidden');
   blobs = [];
   selectedBlobIdx = null;
+  clearFloatingLabels();
   startCamera();
 });
 
 document.getElementById('scan-done').addEventListener('click', () => {
+  // Apply all labeled blob counts in batch
+  for (const blob of blobs) {
+    if (blob.partKey) {
+      window.lostbricks.incrementPart(blob.partKey);
+    }
+  }
   // Save full session data (fire-and-forget), then close
   apiSaveSession();
   closeScan();
@@ -923,6 +1374,7 @@ document.getElementById('picker-close').addEventListener('click', () => {
   hidePartPicker();
   selectedBlobIdx = null;
   drawAnnotatedPhoto();
+  updateFloatingLabels();
 });
 
 document.getElementById('picker-delete').addEventListener('click', () => {
@@ -933,5 +1385,6 @@ document.getElementById('picker-delete').addEventListener('click', () => {
     hidePartPicker();
     updateStatus();
     drawAnnotatedPhoto();
+    updateFloatingLabels();
   }
 });

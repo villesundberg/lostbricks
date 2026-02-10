@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LostBricks ML Debug</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #eee; padding: 16px; }
+h1 { margin-bottom: 8px; }
+.stats { color: #888; margin-bottom: 16px; font-size: 0.9rem; }
+.stats .good { color: #2ecc71; }
+.stats .bad { color: #e94560; }
+.filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.filters button { padding: 6px 14px; border: 2px solid #2a2a4a; border-radius: 16px; background: #16213e; color: #eee; font-size: 0.8rem; cursor: pointer; }
+.filters button.active { border-color: #e94560; background: #0f3460; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.card { background: #16213e; border-radius: 10px; padding: 12px; border: 2px solid transparent; cursor: pointer; }
+.card:hover { border-color: #0f3460; }
+.card.wrong { border-color: #e94560; }
+.card.flagged { border-color: #f1c40f; }
+.card-top { display: flex; gap: 10px; margin-bottom: 8px; }
+.card-top img { width: 80px; height: 80px; object-fit: contain; background: #fff; border-radius: 6px; flex-shrink: 0; }
+.card-info { flex: 1; min-width: 0; }
+.card-label { font-weight: 600; font-size: 0.85rem; margin-bottom: 4px; }
+.card-label .key { color: #888; font-weight: 400; }
+.card-time { font-size: 0.75rem; color: #666; }
+.suggestions { font-size: 0.8rem; }
+.suggestions .row { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+.suggestions .rank { width: 18px; color: #666; flex-shrink: 0; text-align: right; }
+.suggestions .swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0; }
+.suggestions .sk { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggestions .dist { color: #888; flex-shrink: 0; }
+.suggestions .row.match { color: #2ecc71; font-weight: 600; }
+.suggestions .row.top-wrong { color: #e94560; }
+.color-info { display: flex; gap: 8px; margin: 6px 0; align-items: center; font-size: 0.75rem; }
+.color-info .swatch-lg { width: 24px; height: 24px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); }
+.color-info span { color: #888; }
+.btn-flag { margin-top: 6px; padding: 4px 10px; font-size: 0.75rem; border: 1px solid #666; border-radius: 4px; background: transparent; color: #888; cursor: pointer; }
+.btn-flag:hover { border-color: #f1c40f; color: #f1c40f; }
+.btn-flag.flagged { border-color: #f1c40f; color: #f1c40f; background: rgba(241,196,15,0.1); }
+.loading { text-align: center; padding: 60px; color: #666; }
+
+/* Inspector Modal */
+.inspector-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.9);
+  z-index: 100;
+  padding: 24px;
+  overflow-y: auto;
+}
+.inspector-overlay.open {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+.inspector-panel {
+  background: #16213e;
+  border-radius: 12px;
+  max-width: 960px;
+  width: 100%;
+  padding: 20px;
+}
+.inspector-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.inspector-header h3 { flex: 1; font-size: 1rem; }
+.inspector-header .close-btn {
+  font-size: 1.4rem;
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  line-height: 1;
+}
+.inspector-header .close-btn:hover { color: #eee; }
+.inspector-body {
+  display: flex;
+  gap: 20px;
+}
+@media (max-width: 700px) {
+  .inspector-body { flex-direction: column; }
+  .inspector-sidebar { width: 100% !important; }
+}
+.inspector-canvas-wrap {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  background: #0a0a1a;
+  border-radius: 8px;
+  padding: 12px;
+  overflow: auto;
+  min-height: 200px;
+}
+#inspector-canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+.inspector-sidebar {
+  width: 260px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  font-size: 0.85rem;
+}
+.inspector-sidebar label { color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
+.sidebar-section { display: flex; flex-direction: column; gap: 6px; }
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.slider-row input[type=range] { flex: 1; accent-color: #e94560; }
+.slider-row .val { min-width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+.btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn-row button {
+  padding: 5px 12px;
+  border: 1px solid #2a2a4a;
+  border-radius: 4px;
+  background: transparent;
+  color: #888;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.btn-row button.active { border-color: #e94560; color: #eee; background: rgba(233,69,96,0.15); }
+.btn-row button.paint-active { border-color: #2ecc71; color: #2ecc71; background: rgba(46,204,113,0.15); }
+.color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.color-swatch {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.2);
+  flex-shrink: 0;
+}
+.color-vals { font-size: 0.8rem; color: #ccc; }
+.color-vals small { color: #666; }
+.stat-line { font-size: 0.8rem; color: #aaa; }
+.stat-line strong { color: #eee; }
+
+/* Histogram */
+.histogram-wrap {
+  display: flex;
+  gap: 4px;
+  height: 60px;
+  align-items: flex-end;
+  background: #0a0a1a;
+  border-radius: 6px;
+  padding: 6px;
+}
+.histo-bar {
+  flex: 1;
+  min-width: 0;
+  border-radius: 2px 2px 0 0;
+}
+</style>
+</head>
+<body>
+<h1>ML Debug</h1>
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+  <div class="stats" id="stats" style="margin:0;flex:1"></div>
+  <button onclick="runDedup()" style="padding:6px 12px;border:1px solid #e94560;background:rgba(233,69,96,0.15);color:#e94560;border-radius:6px;font-size:0.8rem;cursor:pointer">Dedup &amp; Clean</button>
+</div>
+<div class="filters" id="filters"></div>
+<div class="grid" id="grid"></div>
+<div class="loading" id="loading">Loading analysis...</div>
+
+<!-- Inspector Modal -->
+<div class="inspector-overlay" id="inspector-overlay">
+  <div class="inspector-panel">
+    <div class="inspector-header">
+      <button class="close-btn" onclick="closeInspector()">&times;</button>
+      <h3 id="inspector-title">Crop Inspector</h3>
+    </div>
+    <div class="inspector-body">
+      <div class="inspector-canvas-wrap">
+        <canvas id="inspector-canvas"></canvas>
+      </div>
+      <div class="inspector-sidebar">
+        <!-- View mode -->
+        <div class="sidebar-section">
+          <label>View</label>
+          <div class="btn-row" id="view-btns">
+            <button class="active" data-view="overlay">Overlay</button>
+            <button data-view="masked">Masked</button>
+            <button data-view="original">Original</button>
+          </div>
+        </div>
+
+        <!-- Threshold -->
+        <div class="sidebar-section">
+          <label>Brightness threshold</label>
+          <div class="slider-row">
+            <input type="range" id="threshold-slider" min="80" max="255" value="176">
+            <span class="val" id="threshold-val">176</span>
+          </div>
+        </div>
+
+        <!-- Paint -->
+        <div class="sidebar-section">
+          <label>Paint (click pixels to fix mask)</label>
+          <div class="btn-row">
+            <button id="paint-toggle">Paint off</button>
+            <button id="clear-overrides" style="color:#888">Clear edits</button>
+          </div>
+        </div>
+
+        <!-- Average color from mask -->
+        <div class="sidebar-section">
+          <label>Avg color (foreground pixels)</label>
+          <div class="color-row">
+            <div class="color-swatch" id="avg-swatch"></div>
+            <div class="color-vals">
+              <div id="avg-rgb">—</div>
+              <small id="fg-count">—</small>
+            </div>
+          </div>
+        </div>
+
+        <!-- Learned color comparison -->
+        <div class="sidebar-section">
+          <label>Learned color for this part</label>
+          <div class="color-row">
+            <div class="color-swatch" id="learned-swatch"></div>
+            <div class="color-vals">
+              <div id="learned-rgb">—</div>
+              <small id="learned-count">—</small>
+            </div>
+          </div>
+        </div>
+
+        <!-- Brightness histogram -->
+        <div class="sidebar-section">
+          <label>Brightness histogram</label>
+          <div class="histogram-wrap" id="histogram"></div>
+        </div>
+
+        <!-- RGB histograms -->
+        <div class="sidebar-section">
+          <label>R / G / B channels</label>
+          <div class="histogram-wrap" id="histogram-r"></div>
+          <div class="histogram-wrap" id="histogram-g"></div>
+          <div class="histogram-wrap" id="histogram-b"></div>
+        </div>
+
+        <!-- Relabel -->
+        <div class="sidebar-section">
+          <label>Relabel this crop</label>
+          <select id="relabel-select" style="padding:6px;border-radius:4px;background:#0a0a1a;color:#eee;border:1px solid #2a2a4a;font-size:0.8rem">
+            <option value="">— pick correct label —</option>
+          </select>
+          <div class="btn-row">
+            <button id="relabel-btn" style="border-color:#f39c12;color:#f39c12">Relabel</button>
+            <button id="delete-crop-btn" style="border-color:#e94560;color:#e94560">Delete crop</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SET_NUM = '42078-1'; // TODO: make configurable
+
+const LEGO_COLORS = {
+  '0': {name:'Black', hex:'05131D'}, '1': {name:'Blue', hex:'0055BF'},
+  '2': {name:'Green', hex:'237841'}, '4': {name:'Red', hex:'C91A09'},
+  '14': {name:'Yellow', hex:'F2CD37'}, '19': {name:'Tan', hex:'E4CD9E'},
+  '28': {name:'Dark Tan', hex:'958A73'}, '70': {name:'Reddish Brown', hex:'582A12'},
+  '71': {name:'Light Bluish Gray', hex:'A0A5A9'}, '72': {name:'Dark Bluish Gray', hex:'6C6E68'},
+};
+
+let allCrops = [];
+let learnedColors = {};
+let learnedThreshold = 200;
+let allKeys = [];
+let filter = 'all';
+
+function colorName(cid) { return LEGO_COLORS[cid]?.name || `Color ${cid}`; }
+
+function learnedRGB(cid) {
+  const lc = learnedColors[cid];
+  return lc ? `rgb(${Math.round(lc.r)},${Math.round(lc.g)},${Math.round(lc.b)})` : `#${LEGO_COLORS[cid]?.hex || '333'}`;
+}
+
+function timeAgo(ts) {
+  const d = Date.now() - ts;
+  if (d < 60000) return 'just now';
+  if (d < 3600000) return `${Math.floor(d/60000)}m ago`;
+  if (d < 86400000) return `${Math.floor(d/3600000)}h ago`;
+  return `${Math.floor(d/86400000)}d ago`;
+}
+
+// ── Grid rendering ──
+
+function render() {
+  const grid = document.getElementById('grid');
+  let crops = allCrops;
+
+  if (filter === 'wrong') crops = crops.filter(c => !c.correct);
+  else if (filter === 'flagged') crops = crops.filter(c => c._flagged);
+  else if (filter !== 'all') crops = crops.filter(c => c.colorId === filter);
+
+  grid.innerHTML = crops.map((c) => {
+    const imgSrc = c.path;
+    const partKey = c.key;
+    const [partNum, colorId] = partKey.split('_');
+    const isWrong = !c.correct;
+    const globalIdx = allCrops.indexOf(c);
+
+    let sugHTML = c.suggestions.map((s, si) => {
+      const [sp, sc] = s.key.split('_');
+      const cls = s.key === partKey ? 'match' : (si === 0 && isWrong ? 'top-wrong' : '');
+      return `<div class="row ${cls}">
+        <span class="rank">${si+1}</span>
+        <span class="swatch" style="background:${learnedRGB(sc)}"></span>
+        <span class="sk" title="${s.key}">${s.key} (${colorName(sc)})</span>
+        <span class="dist">${s.dist.toFixed(3)}</span>
+      </div>`;
+    }).join('');
+
+    const correctRank = c.suggestions.findIndex(s => s.key === partKey);
+    const rankLabel = correctRank === 0 ? 'rank 1' :
+      correctRank > 0 ? `rank ${correctRank + 1}` : 'not in top 5';
+
+    return `<div class="card ${isWrong ? 'wrong' : ''} ${c._flagged ? 'flagged' : ''}" onclick="openInspector(${globalIdx})" data-idx="${globalIdx}">
+      <div class="card-top">
+        <img src="${imgSrc}" alt="" loading="lazy">
+        <div class="card-info">
+          <div class="card-label">
+            ${partNum} <span class="key">${colorName(colorId)}</span>
+          </div>
+          <div class="color-info">
+            <span class="swatch-lg" style="background:${learnedRGB(colorId)}"></span>
+            <span>learned</span>
+            <span class="swatch-lg" style="background:#${LEGO_COLORS[colorId]?.hex || '333'}"></span>
+            <span>catalog</span>
+          </div>
+          <div class="card-time">${timeAgo(c.timestamp)} &middot; ${rankLabel}</div>
+        </div>
+      </div>
+      <div class="suggestions">${sugHTML}</div>
+      <button class="btn-flag ${c._flagged ? 'flagged' : ''}" onclick="event.stopPropagation();toggleFlag(${globalIdx})">
+        ${c._flagged ? 'Flagged' : 'Flag'}
+      </button>
+    </div>`;
+  }).join('');
+}
+
+function renderFilters() {
+  const colorCounts = {};
+  let wrongCount = 0;
+  let flagCount = 0;
+  for (const c of allCrops) {
+    colorCounts[c.colorId] = (colorCounts[c.colorId] || 0) + 1;
+    if (!c.correct) wrongCount++;
+    if (c._flagged) flagCount++;
+  }
+
+  const el = document.getElementById('filters');
+  let html = `<button class="${filter==='all'?'active':''}" onclick="setFilter('all')">All (${allCrops.length})</button>`;
+  html += `<button class="${filter==='wrong'?'active':''}" onclick="setFilter('wrong')">Wrong (${wrongCount})</button>`;
+  if (flagCount) html += `<button class="${filter==='flagged'?'active':''}" onclick="setFilter('flagged')">Flagged (${flagCount})</button>`;
+
+  const sorted = Object.entries(colorCounts).sort((a,b) => b[1]-a[1]);
+  for (const [cid, cnt] of sorted) {
+    html += `<button class="${filter===cid?'active':''}" onclick="setFilter('${cid}')">
+      <span class="swatch" style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${learnedRGB(cid)};margin-right:4px;vertical-align:middle"></span>
+      ${colorName(cid)} (${cnt})
+    </button>`;
+  }
+  el.innerHTML = html;
+}
+
+function setFilter(f) {
+  filter = f;
+  renderFilters();
+  render();
+}
+
+async function toggleFlag(idx) {
+  const c = allCrops[idx];
+  c._flagged = !c._flagged;
+  if (c._flagged) {
+    const note = prompt('Optional note (e.g. "clearly red, guessed brown"):', '');
+    if (note === null) { c._flagged = false; return; }
+    await fetch('api/flag', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ path: c.path, key: c.key, note }),
+    });
+  }
+  renderFilters();
+  render();
+}
+
+// ── Inspector ──
+
+let inspectorImg = null;
+let origPixels = null;   // Uint8ClampedArray copy of original image data
+let maskBase = null;      // Uint8Array from threshold
+let maskOverrides = null; // Map<pixelIndex, 0|1>
+let inspThreshold = 176;
+let viewMode = 'overlay';
+let paintActive = false;
+let painting = false;     // currently dragging
+let paintVal = 0;         // value to paint (0=remove, 1=add)
+let inspZoom = 6;
+let inspCropData = null;
+
+function openInspector(cropIdx) {
+  const crop = allCrops[cropIdx];
+  inspCropData = crop;
+  maskOverrides = new Map();
+  paintActive = false;
+  painting = false;
+  viewMode = 'overlay';
+  inspThreshold = learnedThreshold;
+
+  // Update UI state
+  document.getElementById('threshold-slider').value = inspThreshold;
+  document.getElementById('threshold-val').textContent = inspThreshold;
+  document.getElementById('paint-toggle').textContent = 'Paint off';
+  document.getElementById('paint-toggle').classList.remove('paint-active');
+  document.querySelectorAll('#view-btns button').forEach(b => {
+    b.classList.toggle('active', b.dataset.view === 'overlay');
+  });
+
+  const [partNum, colorId] = crop.key.split('_');
+  document.getElementById('inspector-title').textContent =
+    `${partNum} — ${colorName(colorId)}`;
+
+  // Show learned color for comparison
+  const lc = learnedColors[colorId];
+  if (lc) {
+    document.getElementById('learned-swatch').style.background =
+      `rgb(${Math.round(lc.r)},${Math.round(lc.g)},${Math.round(lc.b)})`;
+    document.getElementById('learned-rgb').textContent =
+      `rgb(${Math.round(lc.r)}, ${Math.round(lc.g)}, ${Math.round(lc.b)})`;
+    document.getElementById('learned-count').textContent = `from ${lc.count} samples`;
+  } else {
+    document.getElementById('learned-swatch').style.background = '#333';
+    document.getElementById('learned-rgb').textContent = 'no data';
+    document.getElementById('learned-count').textContent = '';
+  }
+
+  // Load image
+  inspectorImg = new Image();
+  inspectorImg.onload = () => {
+    const canvas = document.getElementById('inspector-canvas');
+    const w = inspectorImg.naturalWidth;
+    const h = inspectorImg.naturalHeight;
+
+    // Dynamic zoom: target ~400px display width
+    inspZoom = Math.max(2, Math.min(8, Math.floor(400 / Math.max(w, h))));
+
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.width = w * inspZoom + 'px';
+    canvas.style.height = h * inspZoom + 'px';
+
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(inspectorImg, 0, 0);
+    origPixels = ctx.getImageData(0, 0, w, h).data.slice();
+
+    recomputeMask();
+    renderInspector();
+    updateInspectorInfo();
+  };
+  inspectorImg.src = crop.path;
+
+  // Populate relabel dropdown
+  const sel = document.getElementById('relabel-select');
+  sel.innerHTML = '<option value="">— pick correct label —</option>';
+  for (const k of allKeys) {
+    const [pn, ci] = k.split('_');
+    sel.innerHTML += `<option value="${k}" ${k === crop.key ? 'selected disabled' : ''}>${k} (${colorName(ci)})</option>`;
+  }
+
+  document.getElementById('inspector-overlay').classList.add('open');
+}
+
+function closeInspector() {
+  document.getElementById('inspector-overlay').classList.remove('open');
+  inspectorImg = null;
+  origPixels = null;
+  maskBase = null;
+}
+
+function recomputeMask() {
+  const total = inspectorImg.naturalWidth * inspectorImg.naturalHeight;
+  maskBase = new Uint8Array(total);
+  for (let i = 0; i < total; i++) {
+    const r = origPixels[i * 4];
+    const g = origPixels[i * 4 + 1];
+    const b = origPixels[i * 4 + 2];
+    const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (brightness < inspThreshold) {
+      maskBase[i] = 1;
+    } else {
+      // Recover bright-but-colorful pixels (yellow, tan)
+      const mx = Math.max(r, g, b);
+      const sat = mx > 0 ? (mx - Math.min(r, g, b)) / mx : 0;
+      maskBase[i] = sat > 0.15 ? 1 : 0;
+    }
+  }
+}
+
+function getEffectiveMask() {
+  const mask = new Uint8Array(maskBase);
+  for (const [idx, val] of maskOverrides) {
+    mask[idx] = val;
+  }
+  return mask;
+}
+
+function renderInspector() {
+  const canvas = document.getElementById('inspector-canvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const total = w * h;
+  const mask = getEffectiveMask();
+
+  const imageData = ctx.createImageData(w, h);
+  const data = imageData.data;
+
+  for (let i = 0; i < total; i++) {
+    const r = origPixels[i * 4];
+    const g = origPixels[i * 4 + 1];
+    const b = origPixels[i * 4 + 2];
+
+    if (viewMode === 'overlay') {
+      if (mask[i]) {
+        // Foreground: slight green tint
+        data[i*4]   = Math.floor(r * 0.7);
+        data[i*4+1] = Math.min(255, Math.floor(g * 0.7 + 60));
+        data[i*4+2] = Math.floor(b * 0.7);
+      } else {
+        // Background: red tint
+        data[i*4]   = Math.min(255, Math.floor(r * 0.4 + 140));
+        data[i*4+1] = Math.floor(g * 0.25);
+        data[i*4+2] = Math.floor(b * 0.25);
+      }
+    } else if (viewMode === 'masked') {
+      if (mask[i]) {
+        data[i*4]   = r;
+        data[i*4+1] = g;
+        data[i*4+2] = b;
+      } else {
+        data[i*4]   = 240;
+        data[i*4+1] = 240;
+        data[i*4+2] = 240;
+      }
+    } else {
+      // original
+      data[i*4]   = r;
+      data[i*4+1] = g;
+      data[i*4+2] = b;
+    }
+    data[i*4+3] = 255;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+function updateInspectorInfo() {
+  const mask = getEffectiveMask();
+  const total = inspectorImg.naturalWidth * inspectorImg.naturalHeight;
+
+  let totalR = 0, totalG = 0, totalB = 0, fgCount = 0;
+  // Also build histograms
+  const histBright = new Float64Array(16);
+  const histR = new Float64Array(16);
+  const histG = new Float64Array(16);
+  const histB = new Float64Array(16);
+
+  for (let i = 0; i < total; i++) {
+    const r = origPixels[i * 4];
+    const g = origPixels[i * 4 + 1];
+    const b = origPixels[i * 4 + 2];
+    if (mask[i]) {
+      totalR += r;
+      totalG += g;
+      totalB += b;
+      fgCount++;
+
+      const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
+      histBright[Math.min(15, Math.floor(brightness / 16))]++;
+      histR[Math.min(15, Math.floor(r / 16))]++;
+      histG[Math.min(15, Math.floor(g / 16))]++;
+      histB[Math.min(15, Math.floor(b / 16))]++;
+    }
+  }
+
+  const avgR = fgCount ? Math.round(totalR / fgCount) : 0;
+  const avgG = fgCount ? Math.round(totalG / fgCount) : 0;
+  const avgB = fgCount ? Math.round(totalB / fgCount) : 0;
+
+  document.getElementById('avg-swatch').style.background = `rgb(${avgR},${avgG},${avgB})`;
+  document.getElementById('avg-rgb').textContent = `rgb(${avgR}, ${avgG}, ${avgB})`;
+  document.getElementById('fg-count').textContent = `${fgCount}/${total} px (${(100*fgCount/total).toFixed(0)}%)`;
+
+  // Render histograms
+  renderHistogram('histogram', histBright, '#aaa');
+  renderHistogram('histogram-r', histR, '#e94560');
+  renderHistogram('histogram-g', histG, '#2ecc71');
+  renderHistogram('histogram-b', histB, '#3498db');
+}
+
+function renderHistogram(elId, bins, color) {
+  const max = Math.max(...bins);
+  if (max === 0) return;
+  const el = document.getElementById(elId);
+  let html = '';
+  for (let i = 0; i < bins.length; i++) {
+    const pct = (bins[i] / max * 100).toFixed(0);
+    html += `<div class="histo-bar" style="height:${Math.max(1, pct)}%;background:${color}" title="bin ${i*16}-${(i+1)*16-1}: ${bins[i]}"></div>`;
+  }
+  el.innerHTML = html;
+}
+
+// Inspector event handlers
+document.getElementById('threshold-slider').addEventListener('input', (e) => {
+  inspThreshold = parseInt(e.target.value);
+  document.getElementById('threshold-val').textContent = inspThreshold;
+  recomputeMask();
+  renderInspector();
+  updateInspectorInfo();
+});
+
+document.querySelectorAll('#view-btns button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    viewMode = btn.dataset.view;
+    document.querySelectorAll('#view-btns button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderInspector();
+  });
+});
+
+document.getElementById('paint-toggle').addEventListener('click', () => {
+  paintActive = !paintActive;
+  const btn = document.getElementById('paint-toggle');
+  btn.textContent = paintActive ? 'Paint ON' : 'Paint off';
+  btn.classList.toggle('paint-active', paintActive);
+  document.getElementById('inspector-canvas').style.cursor = paintActive ? 'crosshair' : 'default';
+});
+
+document.getElementById('clear-overrides').addEventListener('click', () => {
+  maskOverrides = new Map();
+  renderInspector();
+  updateInspectorInfo();
+});
+
+// Paint: pointer events on canvas
+const inspCanvas = document.getElementById('inspector-canvas');
+
+inspCanvas.addEventListener('pointerdown', (e) => {
+  if (!paintActive || !origPixels) return;
+  e.preventDefault();
+  inspCanvas.setPointerCapture(e.pointerId);
+  painting = true;
+
+  const rect = inspCanvas.getBoundingClientRect();
+  const x = Math.floor((e.clientX - rect.left) / inspZoom);
+  const y = Math.floor((e.clientY - rect.top) / inspZoom);
+  const w = inspCanvas.width;
+  if (x < 0 || y < 0 || x >= w || y >= inspCanvas.height) return;
+
+  const idx = y * w + x;
+  const currentMask = getEffectiveMask();
+  // Toggle: if currently foreground → paint as background, and vice versa
+  paintVal = currentMask[idx] ? 0 : 1;
+  maskOverrides.set(idx, paintVal);
+  renderInspector();
+  updateInspectorInfo();
+});
+
+inspCanvas.addEventListener('pointermove', (e) => {
+  if (!painting) return;
+  const rect = inspCanvas.getBoundingClientRect();
+  const x = Math.floor((e.clientX - rect.left) / inspZoom);
+  const y = Math.floor((e.clientY - rect.top) / inspZoom);
+  const w = inspCanvas.width;
+  if (x < 0 || y < 0 || x >= w || y >= inspCanvas.height) return;
+
+  const idx = y * w + x;
+  maskOverrides.set(idx, paintVal);
+  renderInspector();
+  updateInspectorInfo();
+});
+
+inspCanvas.addEventListener('pointerup', () => { painting = false; });
+inspCanvas.addEventListener('pointercancel', () => { painting = false; });
+
+// Close on overlay click
+document.getElementById('inspector-overlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeInspector();
+});
+
+// Close on Escape
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeInspector();
+});
+
+// Relabel
+document.getElementById('relabel-btn').addEventListener('click', async () => {
+  if (!inspCropData) return;
+  const newKey = document.getElementById('relabel-select').value;
+  if (!newKey || newKey === inspCropData.key) {
+    alert('Pick a different label');
+    return;
+  }
+  const [np, nc] = newKey.split('_');
+  if (!confirm(`Relabel this crop from ${inspCropData.key} to ${newKey} (${colorName(nc)})?`)) return;
+
+  const res = await fetch('api/relabel', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ setNum: SET_NUM, path: inspCropData.path, newKey }),
+  });
+  const data = await res.json();
+  if (data.ok) {
+    closeInspector();
+    load(); // reload everything
+  } else {
+    alert('Error: ' + (data.error || 'unknown'));
+  }
+});
+
+// Delete crop
+document.getElementById('delete-crop-btn').addEventListener('click', async () => {
+  if (!inspCropData) return;
+  if (!confirm(`Delete this crop (${inspCropData.key})? This removes it from the index and disk.`)) return;
+
+  const res = await fetch('api/delete-crop', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ setNum: SET_NUM, path: inspCropData.path }),
+  });
+  const data = await res.json();
+  closeInspector();
+  load();
+});
+
+// ── Data loading ──
+
+async function load() {
+  try {
+    const res = await fetch(`api/debug/${SET_NUM}`);
+    const data = await res.json();
+    allCrops = data.crops;
+    learnedColors = data.learnedColors;
+    learnedThreshold = data.threshold || 200;
+    allKeys = data.keys || [];
+
+    document.getElementById('loading').style.display = 'none';
+    const s = data.stats;
+    const pct = (100 * s.correct / s.total).toFixed(1);
+    document.getElementById('stats').innerHTML =
+      `${s.total} crops, ${s.uniqueParts} unique parts &middot; ` +
+      `Leave-one-out accuracy: <span class="good">${s.correct}/${s.total} (${pct}%)</span> &middot; ` +
+      `<span class="bad">${s.total - s.correct} wrong</span>`;
+
+    renderFilters();
+    render();
+  } catch (e) {
+    document.getElementById('loading').textContent = 'Error: ' + e.message;
+  }
+}
+
+async function runDedup() {
+  if (!confirm('Remove duplicate crops from index and disk?')) return;
+  const res = await fetch('api/dedup', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ setNum: SET_NUM }),
+  });
+  const data = await res.json();
+  alert(`Removed ${data.removed} duplicates, ${data.remaining} crops remaining`);
+  load();
+}
+
+load();
+</script>
+</body>
+</html>

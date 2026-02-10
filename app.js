@@ -500,6 +500,25 @@ document.getElementById('have-all-btn').addEventListener('click', () => {
   renderParts();
 });
 
+document.getElementById('reset-btn').addEventListener('click', () => {
+  if (!confirm('Reset all counts to zero for this set?')) return;
+  if (!confirm('Are you sure? This cannot be undone.')) return;
+  const s = state.sets[currentSet];
+  if (!s) return;
+  for (const key in s.have) {
+    s.have[key] = 0;
+  }
+  saveState();
+  // Also reset on server
+  fetch('api/reset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ setNum: currentSet }),
+  }).catch(() => {});
+  renderSummary();
+  renderParts();
+});
+
 // ── Rebrickable Sync ──
 
 async function getUserToken(username, password) {
@@ -768,6 +787,14 @@ window.lostbricks = {
     if (!s) return;
     if (!(key in s.have)) s.have[key] = 0;
     s.have[key]++;
+    saveState();
+    renderSummary();
+    renderParts();
+  },
+  decrementPart(key) {
+    const s = state.sets[currentSet];
+    if (!s || !s.have[key]) return;
+    s.have[key] = Math.max(0, s.have[key] - 1);
     saveState();
     renderSummary();
     renderParts();
