@@ -806,6 +806,16 @@ header h2 {
   color: var(--text-dim);
 }
 
+.picker-item.ml-top {
+  border-color: var(--ok);
+  box-shadow: 0 0 8px rgba(46, 204, 113, 0.4);
+}
+
+.picker-item.ml-top .picker-label {
+  color: var(--ok);
+  font-weight: 600;
+}
+
 /* Loading spinner */
 .loading {
   text-align: center;

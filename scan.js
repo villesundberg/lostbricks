@@ -39,13 +39,16 @@ function segmentImage(canvas) {
   const data = imageData.data;
   const totalPixels = width * height;
 
+  const threshold = learnedThreshold || 200;
+  console.log(`segmentation threshold: ${threshold}${learnedThreshold ? ' (learned)' : ' (default)'}`);
+
   const mask = new Uint8Array(totalPixels);
   for (let i = 0; i < totalPixels; i++) {
     const r = data[i * 4];
     const g = data[i * 4 + 1];
     const b = data[i * 4 + 2];
     const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
-    mask[i] = brightness < 200 ? 1 : 0;
+    mask[i] = brightness < threshold ? 1 : 0;
   }
 
   // Connected components via BFS
@@ -132,15 +135,56 @@ function blobToBase64(blob) {
   return tmp.toDataURL('image/jpeg', 0.8).split(',')[1];
 }
 
-async function apiLabel(setNum, partNum, colorId, jpegB64) {
+function canvasToBase64(canvas) {
+  return canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+}
+
+async function apiSaveSession() {
+  if (!capturedCanvas || !rawCanvas) return;
+  const setNum = window.lostbricks.getCurrentSetNum();
+  const stripBlob = (b) => ({
+    minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY,
+    avgR: b.avgR, avgG: b.avgG, avgB: b.avgB,
+    source: b.source || 'auto',
+    partKey: b.partKey, partName: b.partName,
+  });
+  const payload = {
+    setNum,
+    timestamp: Date.now(),
+    rawPhoto: canvasToBase64(rawCanvas),
+    cropRect: { ...cropRect },
+    croppedPhoto: canvasToBase64(capturedCanvas),
+    blobs: blobs.map(stripBlob),
+    deletedBlobs: deletedBlobs.map(stripBlob),
+  };
   try {
-    const res = await fetch('/api/label', {
+    const res = await fetch('api/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ setNum, partNum, colorId: String(colorId), jpeg: jpegB64 }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
-    if (data.ok) console.log(`learn: ${partNum}_${colorId} (${data.count} crops for set)`);
+    if (data.ok) console.log(`session saved: ${data.path}`);
+    else console.warn('session save error:', data.error);
+  } catch (e) {
+    console.warn('session save failed:', e);
+  }
+}
+
+async function apiLabel(setNum, partNum, colorId, jpegB64, avgR, avgG, avgB) {
+  try {
+    const res = await fetch('api/label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ setNum, partNum, colorId: String(colorId), jpeg: jpegB64, avgR, avgG, avgB }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      // Update local learned colors cache immediately
+      if (data.learnedColors) learnedColors = data.learnedColors;
+      if (data.cropCount) learnedCropCount = data.cropCount;
+      console.log(`learn: ${partNum}_${colorId} (${data.cropCount} crops)`);
+    }
     else console.warn('learn error:', data.error);
   } catch (e) {
     console.warn('learn send failed:', e);
@@ -149,16 +193,42 @@ async function apiLabel(setNum, partNum, colorId, jpegB64) {
 
 async function apiSuggest(setNum, jpegB64) {
   try {
-    const res = await fetch('/api/suggest', {
+    const res = await fetch('api/suggest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ setNum, jpeg: jpegB64 }),
     });
     const data = await res.json();
-    return data.suggestions || []; // [{ key, dist }, ...]
+    return {
+      suggestions: data.suggestions || [],
+      learnedColors: data.learnedColors || {},
+      cropCount: data.cropCount || 0,
+    };
   } catch (e) {
     console.warn('suggest failed:', e);
-    return [];
+    return { suggestions: [], learnedColors: {}, cropCount: 0 };
+  }
+}
+
+// Cached learned data (updated with each suggest call)
+let learnedColors = {}; // { colorId: { r, g, b, count } }
+let learnedCropCount = 0;
+let learnedThreshold = null; // learned brightness threshold for segmentation
+
+async function fetchLearnedParams() {
+  const setNum = window.lostbricks.getCurrentSetNum();
+  if (!setNum) return;
+  try {
+    const res = await fetch(`api/learned/${setNum}`);
+    const data = await res.json();
+    if (data.colors) learnedColors = data.colors;
+    learnedCropCount = data.cropCount || 0;
+    if (data.threshold) {
+      learnedThreshold = data.threshold;
+      console.log(`learned threshold: ${learnedThreshold} (from server)`);
+    }
+  } catch (e) {
+    console.warn('fetch learned failed:', e);
   }
 }
 
@@ -199,8 +269,9 @@ function captureFrame() {
 
 // ── UI State ──
 
-let blobs = []; // { minX, minY, maxX, maxY, avgR, avgG, avgB, partKey, partName }
-let capturedCanvas = null; // original captured frame
+let blobs = []; // { minX, minY, maxX, maxY, avgR, avgG, avgB, partKey, partName, source }
+let deletedBlobs = []; // blobs the user explicitly removed
+let capturedCanvas = null; // cropped frame
 let selectedBlobIdx = null;
 
 function openScan() {
@@ -210,8 +281,10 @@ function openScan() {
   document.getElementById('scan-annotate').classList.add('hidden');
   document.getElementById('part-picker').classList.add('hidden');
   blobs = [];
+  deletedBlobs = [];
   selectedBlobIdx = null;
   capturedCanvas = null;
+  fetchLearnedParams(); // get latest threshold + colors from server
   startCamera();
 }
 
@@ -222,7 +295,7 @@ function closeScan() {
 
 function showAnnotated(detected) {
   blobs = detected.map((c) => ({
-    ...c, partKey: null, partName: null,
+    ...c, partKey: null, partName: null, source: 'auto',
   }));
   stopCamera();
   document.getElementById('scan-viewfinder').classList.add('hidden');
@@ -392,7 +465,7 @@ function canvasPointerUp(e) {
   for (let i = 0; i < totalPx; i++) {
     const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
     const brightness = 0.299 * r + 0.587 * g + 0.114 * b;
-    if (brightness < 200) {
+    if (brightness < (learnedThreshold || 200)) {
       totalR += r;
       totalG += g;
       totalB += b;
@@ -409,7 +482,7 @@ function canvasPointerUp(e) {
     avgR: Math.round(totalR / fgCount),
     avgG: Math.round(totalG / fgCount),
     avgB: Math.round(totalB / fgCount),
-    partKey: null, partName: null,
+    partKey: null, partName: null, source: 'manual',
   };
   blobs.push(newBlob);
   selectedBlobIdx = blobs.length - 1;
@@ -487,11 +560,19 @@ function showPartPicker(blob) {
   }
 
   // Score by color distance + remaining need
+  // Use learned photographed colors when available, fall back to catalog
   if (blob) {
     const { avgR, avgG, avgB } = blob;
     pickerParts = pickerParts.map((p) => {
       const key = `${p.partNum}_${p.color.id}`;
-      const [pr, pg, pb] = hexToRGB(p.color.rgb);
+      const lc = learnedColors[String(p.color.id)];
+      let pr, pg, pb;
+      if (lc && lc.count >= 2) {
+        // Use learned photographed color (more accurate than catalog)
+        pr = lc.r; pg = lc.g; pb = lc.b;
+      } else {
+        [pr, pg, pb] = hexToRGB(p.color.rgb);
+      }
       const dist = colorDist(avgR, avgG, avgB, pr, pg, pb);
       const have = window.lostbricks.getHave(key);
       const remaining = Math.max(0, p.qty - have);
@@ -508,12 +589,22 @@ function showPartPicker(blob) {
   // Ask server for ML suggestions (async — updates grid when ready)
   if (jpegB64) {
     const setNum = window.lostbricks.getCurrentSetNum();
-    apiSuggest(setNum, jpegB64).then((suggestions) => {
-      if (suggestions.length === 0) return;
+    apiSuggest(setNum, jpegB64).then((result) => {
+      const { suggestions, learnedColors: lc, cropCount } = result;
+
+      // Update cached learned data
+      if (lc) learnedColors = lc;
+      learnedCropCount = cropCount;
+      if (result.threshold) learnedThreshold = result.threshold;
+
+      if (suggestions.length === 0) {
+        updatePickerTitle();
+        return;
+      }
+
       // Apply ML boost to matching parts
       const boostMap = new Map();
       suggestions.forEach((s, i) => {
-        // Top suggestion gets biggest boost, decaying
         boostMap.set(s.key, 100 - i * 8);
       });
       for (const p of pickerParts) {
@@ -521,19 +612,51 @@ function showPartPicker(blob) {
         const boost = boostMap.get(key);
         if (boost) {
           p.mlBoost = boost;
-          p.score -= boost; // lower score = better
+          p.score -= boost;
         }
       }
       pickerParts.sort((a, b) => a.score - b.score);
-      // Re-render with updated rankings
+
+      // Re-score with learned colors (now that we have fresh data)
+      if (lc && blob) {
+        const { avgR, avgG, avgB } = blob;
+        for (const p of pickerParts) {
+          const lcEntry = lc[String(p.color.id)];
+          if (lcEntry && lcEntry.count >= 2) {
+            p.dist = colorDist(avgR, avgG, avgB, lcEntry.r, lcEntry.g, lcEntry.b);
+          }
+        }
+      }
+
+      // If top suggestion is very confident, auto-select its color tab
+      const topDist = suggestions[0].dist;
+      if (topDist < 0.3 && suggestions.length >= 1) {
+        const topKey = suggestions[0].key;
+        const topPart = pickerParts.find((p) => `${p.partNum}_${p.color.id}` === topKey);
+        if (topPart) {
+          pickerColorFilter = topPart.color.id;
+        }
+      }
+
       buildColorChips();
       renderPickerGrid();
-      console.log(`ML suggest: ${suggestions.length} matches, top=${suggestions[0].key}`);
+      updatePickerTitle();
+      console.log(`ML: ${cropCount} crops, top=${suggestions[0].key} (d=${suggestions[0].dist})`);
     });
   }
 
-  document.getElementById('picker-title').textContent = 'Pick a part';
+  updatePickerTitle();
   document.getElementById('part-picker').classList.remove('hidden');
+}
+
+function updatePickerTitle() {
+  const title = document.getElementById('picker-title');
+  if (learnedCropCount > 0) {
+    const colorCount = Object.keys(learnedColors).length;
+    title.textContent = `Pick a part (${learnedCropCount} learned, ${colorCount} colors)`;
+  } else {
+    title.textContent = 'Pick a part';
+  }
 }
 
 function renderPickerGrid() {
@@ -543,13 +666,15 @@ function renderPickerGrid() {
     filtered = pickerParts.filter((p) => p.color.id === pickerColorFilter);
   }
 
-  grid.innerHTML = filtered.map((p) => {
+  grid.innerHTML = filtered.map((p, i) => {
     const key = `${p.partNum}_${p.color.id}`;
     const remaining = p.remaining !== undefined ? p.remaining : '';
+    const isTopML = p.mlBoost > 80;
+    const cls = `picker-item${isTopML ? ' ml-top' : ''}`;
     return `
-      <div class="picker-item" data-key="${key}" data-name="${p.name}">
+      <div class="${cls}" data-key="${key}" data-name="${p.name}">
         <img src="${p.imgUrl || ''}" alt="" loading="lazy">
-        <div class="picker-label">${p.name}${remaining ? ` (${remaining})` : ''}</div>
+        <div class="picker-label">${p.name}${remaining ? ` (${remaining})` : ''}${isTopML ? ' *' : ''}</div>
       </div>
     `;
   }).join('');
@@ -579,7 +704,7 @@ async function assignPart(key, name) {
   const jpegB64 = blobToBase64(blob);
 
   // Send to server (fire-and-forget)
-  apiLabel(window.lostbricks.getCurrentSetNum(), partNum, colorId, jpegB64);
+  apiLabel(window.lostbricks.getCurrentSetNum(), partNum, colorId, jpegB64, blob.avgR, blob.avgG, blob.avgB);
 
   // Also store in IndexedDB
   try {
@@ -789,7 +914,11 @@ document.getElementById('scan-retake').addEventListener('click', () => {
   startCamera();
 });
 
-document.getElementById('scan-done').addEventListener('click', closeScan);
+document.getElementById('scan-done').addEventListener('click', () => {
+  // Save full session data (fire-and-forget), then close
+  apiSaveSession();
+  closeScan();
+});
 document.getElementById('picker-close').addEventListener('click', () => {
   hidePartPicker();
   selectedBlobIdx = null;
@@ -798,6 +927,7 @@ document.getElementById('picker-close').addEventListener('click', () => {
 
 document.getElementById('picker-delete').addEventListener('click', () => {
   if (selectedBlobIdx !== null) {
+    deletedBlobs.push(blobs[selectedBlobIdx]);
     blobs.splice(selectedBlobIdx, 1);
     selectedBlobIdx = null;
     hidePartPicker();

@@ -18,6 +18,27 @@ function loadState() {
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  // Also persist to server (fire-and-forget)
+  fetch('api/state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(state),
+  }).catch(() => {});
+}
+
+async function loadStateFromServer() {
+  try {
+    const res = await fetch('api/state');
+    const data = await res.json();
+    if (data && data.apiKey) {
+      state = data;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      return true;
+    }
+  } catch (e) {
+    console.warn('Server state load failed, using localStorage', e);
+  }
+  return false;
 }
 
 // ── API ──
@@ -755,11 +776,13 @@ window.lostbricks = {
 
 // ── Init ──
 
-loadState();
-
-if (!state.apiKey) {
-  showScreen('apikey');
-} else {
-  showScreen('home');
-  renderSetList();
-}
+(async () => {
+  await loadStateFromServer();
+  if (!state.apiKey) loadState(); // fallback to localStorage
+  if (!state.apiKey) {
+    showScreen('apikey');
+  } else {
+    showScreen('home');
+    renderSetList();
+  }
+})();
