@@ -60,6 +60,7 @@
           <input type="checkbox" id="hide-complete"> Hide complete
         </label>
         <button id="have-all-btn" class="small-btn">Have All</button>
+        <button id="scan-btn" class="small-btn">Scan</button>
       </div>
       <div id="color-bar"></div>
     </div>
@@ -114,6 +115,45 @@
     </div>
   </div>
 
+  <!-- Scan modal -->
+  <div id="scan-modal" class="modal hidden">
+    <div class="scan-container">
+      <!-- Phase 1: Camera viewfinder -->
+      <div id="scan-viewfinder">
+        <video id="scan-video" autoplay playsinline></video>
+        <div class="scan-toolbar">
+          <button id="scan-close" class="icon-btn">&#10005;</button>
+          <button id="scan-capture">Capture</button>
+          <div style="width:44px"></div>
+        </div>
+      </div>
+      <!-- Phase 2: Annotated photo -->
+      <div id="scan-annotate" class="hidden">
+        <div class="scan-toolbar">
+          <button id="scan-retake" class="icon-btn">&#8592;</button>
+          <span id="scan-status"></span>
+          <button id="scan-done">Done</button>
+        </div>
+        <div id="scan-photo-wrap">
+          <canvas id="scan-canvas"></canvas>
+        </div>
+      </div>
+      <!-- Part picker (bottom sheet) -->
+      <div id="part-picker" class="hidden">
+        <div class="scan-toolbar">
+          <button id="picker-close" class="icon-btn">&#10005;</button>
+          <div id="picker-header">
+            <img id="picker-blob-img" alt="">
+            <span id="picker-title">Pick a part</span>
+          </div>
+          <button id="picker-delete" class="icon-btn danger" title="Delete blob">&#128465;</button>
+        </div>
+        <div id="picker-grid"></div>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
+  <script src="scan.js"></script>
 </body>
 </html>

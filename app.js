@@ -728,6 +728,31 @@ document.getElementById('login-show-pass').addEventListener('click', () => {
   inp.type = inp.type === 'password' ? 'text' : 'password';
 });
 
+// ── Scan integration ──
+
+window.lostbricks = {
+  getCurrentSetParts() {
+    if (!currentSet || !state.sets[currentSet]) return [];
+    return state.sets[currentSet].parts;
+  },
+  getHave(key) {
+    if (!currentSet || !state.sets[currentSet]) return 0;
+    return state.sets[currentSet].have[key] || 0;
+  },
+  getCurrentSetNum() {
+    return currentSet;
+  },
+  incrementPart(key) {
+    const s = state.sets[currentSet];
+    if (!s) return;
+    if (!(key in s.have)) s.have[key] = 0;
+    s.have[key]++;
+    saveState();
+    renderSummary();
+    renderParts();
+  },
+};
+
 // ── Init ──
 
 loadState();
