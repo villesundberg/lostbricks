@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>LostBricks</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Screen: API Key -->
+  <div id="screen-apikey" class="screen">
+    <div class="center-box">
+      <h1>LostBricks</h1>
+      <p>Enter your Rebrickable API key to get started.</p>
+      <form id="apikey-form">
+        <input type="text" id="apikey-input" placeholder="Rebrickable API key" autocomplete="off" spellcheck="false">
+        <button type="submit">Save</button>
+      </form>
+      <p class="hint">Free at <a href="https://rebrickable.com/api/" target="_blank">rebrickable.com/api</a></p>
+    </div>
+  </div>
+
+  <!-- Screen: Home / Set Search -->
+  <div id="screen-home" class="screen hidden">
+    <header>
+      <h1>LostBricks</h1>
+      <button id="settings-btn" class="icon-btn" title="Settings">&#9881;</button>
+    </header>
+    <form id="search-form">
+      <input type="text" id="search-input" placeholder="Set number (e.g. 8880)" inputmode="numeric" autocomplete="off">
+      <button type="submit">Load</button>
+    </form>
+    <div id="search-error" class="error hidden"></div>
+    <div id="set-list"></div>
+  </div>
+
+  <!-- Screen: Inventory -->
+  <div id="screen-inventory" class="screen hidden">
+    <header>
+      <button id="back-btn" class="icon-btn" title="Back">&#8592;</button>
+      <div id="set-info">
+        <h2 id="set-title"></h2>
+        <span id="set-meta"></span>
+      </div>
+      <button id="sync-btn" class="sync-btn">Sync</button>
+      <button id="delete-set-btn" class="icon-btn danger" title="Remove set">&#10005;</button>
+    </header>
+    <div id="inventory-sticky">
+      <div id="summary-bar"></div>
+      <div id="inventory-controls">
+        <select id="sort-select">
+          <option value="missing-first">Most missing first</option>
+          <option value="complete-first">Complete first</option>
+          <option value="color">By color</option>
+          <option value="name">By name</option>
+        </select>
+        <label class="toggle-label">
+          <input type="checkbox" id="hide-complete"> Hide complete
+        </label>
+        <button id="have-all-btn" class="small-btn">Have All</button>
+      </div>
+      <div id="color-bar"></div>
+    </div>
+    <div id="parts-list"></div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-content">
+      <h2>Settings</h2>
+      <form id="settings-form">
+        <label for="settings-apikey">Rebrickable API Key</label>
+        <input type="text" id="settings-apikey" autocomplete="off" spellcheck="false">
+        <div class="modal-buttons">
+          <button type="button" id="settings-cancel">Cancel</button>
+          <button type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Sync preview modal -->
+  <div id="sync-modal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <h2>Sync Preview</h2>
+      <p id="sync-summary" class="hint" style="margin-bottom:12px"></p>
+      <div id="sync-diff"></div>
+      <div class="modal-buttons">
+        <button type="button" id="sync-cancel">Cancel</button>
+        <button type="button" id="sync-confirm">Confirm Sync</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Login modal -->
+  <div id="login-modal" class="modal hidden">
+    <div class="modal-content">
+      <h2>Rebrickable Login</h2>
+      <p class="hint" style="margin-bottom:12px">Log in to sync lost parts to your account.</p>
+      <form id="login-form">
+        <input type="text" id="login-user" placeholder="Username or email" autocomplete="username">
+        <div style="display:flex;gap:8px">
+          <input type="password" id="login-pass" placeholder="Password" autocomplete="current-password">
+          <button type="button" id="login-show-pass" class="icon-btn" style="flex-shrink:0">&#128065;</button>
+        </div>
+        <div id="login-error" class="error hidden"></div>
+        <div class="modal-buttons">
+          <button type="button" id="login-cancel">Cancel</button>
+          <button type="submit">Log in</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
