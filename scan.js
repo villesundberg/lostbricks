@@ -117,6 +117,51 @@ function hexToRGB(hex) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
+// ── Learning API ──
+
+function blobToBase64(blob) {
+  const pad = 8;
+  const x = Math.max(0, blob.minX - pad);
+  const y = Math.max(0, blob.minY - pad);
+  const w = Math.min(capturedCanvas.width, blob.maxX + pad) - x;
+  const h = Math.min(capturedCanvas.height, blob.maxY + pad) - y;
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  tmp.getContext('2d').drawImage(capturedCanvas, x, y, w, h, 0, 0, w, h);
+  // Strip "data:image/jpeg;base64," prefix
+  return tmp.toDataURL('image/jpeg', 0.8).split(',')[1];
+}
+
+async function apiLabel(setNum, partNum, colorId, jpegB64) {
+  try {
+    const res = await fetch('/api/label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ setNum, partNum, colorId: String(colorId), jpeg: jpegB64 }),
+    });
+    const data = await res.json();
+    if (data.ok) console.log(`learn: ${partNum}_${colorId} (${data.count} crops for set)`);
+    else console.warn('learn error:', data.error);
+  } catch (e) {
+    console.warn('learn send failed:', e);
+  }
+}
+
+async function apiSuggest(setNum, jpegB64) {
+  try {
+    const res = await fetch('/api/suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ setNum, jpeg: jpegB64 }),
+    });
+    const data = await res.json();
+    return data.suggestions || []; // [{ key, dist }, ...]
+  } catch (e) {
+    console.warn('suggest failed:', e);
+    return [];
+  }
+}
+
 // ── Camera ──
 
 let stream = null;
@@ -161,6 +206,7 @@ let selectedBlobIdx = null;
 function openScan() {
   document.getElementById('scan-modal').classList.remove('hidden');
   document.getElementById('scan-viewfinder').classList.remove('hidden');
+  document.getElementById('scan-crop').classList.add('hidden');
   document.getElementById('scan-annotate').classList.add('hidden');
   document.getElementById('part-picker').classList.add('hidden');
   blobs = [];
@@ -379,13 +425,51 @@ scanCanvas.addEventListener('pointerup', canvasPointerUp);
 
 // ── Part Picker ──
 
+let pickerBlob = null;
+let pickerParts = []; // deduplicated, scored
+let pickerColorFilter = null; // null = all, or color id
+
+function buildColorChips() {
+  const colorMap = new Map();
+  for (const p of pickerParts) {
+    if (!colorMap.has(p.color.id)) {
+      colorMap.set(p.color.id, { name: p.color.name, rgb: p.color.rgb, dist: p.dist || 0 });
+    }
+  }
+  const sortedColors = [...colorMap.entries()].sort((a, b) => a[1].dist - b[1].dist);
+
+  // Pre-select best matching color if not already set
+  if (pickerColorFilter === null && sortedColors.length > 0) {
+    pickerColorFilter = sortedColors[0][0];
+  }
+
+  const colorsEl = document.getElementById('picker-colors');
+  colorsEl.innerHTML = `<div class="picker-color-chip ${pickerColorFilter === null ? 'active' : ''}" data-color="all">All</div>` +
+    sortedColors.map(([id, c]) =>
+      `<div class="picker-color-chip ${id === pickerColorFilter ? 'active' : ''}" data-color="${id}">
+        <span class="color-swatch" style="background:#${c.rgb}"></span>${c.name}
+      </div>`
+    ).join('');
+
+  colorsEl.querySelectorAll('.picker-color-chip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const val = chip.dataset.color;
+      pickerColorFilter = val === 'all' ? null : parseInt(val);
+      colorsEl.querySelectorAll('.picker-color-chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      renderPickerGrid();
+    });
+  });
+}
+
 function showPartPicker(blob) {
+  pickerColorFilter = null; // reset for each new blob
+  pickerBlob = blob;
   const parts = window.lostbricks.getCurrentSetParts();
-  const grid = document.getElementById('picker-grid');
 
   // Deduplicate
   const seen = new Set();
-  let uniqueParts = parts.filter((p) => {
+  pickerParts = parts.filter((p) => {
     const key = `${p.partNum}_${p.color.id}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -394,45 +478,78 @@ function showPartPicker(blob) {
 
   // Show blob crop in header
   const blobImg = document.getElementById('picker-blob-img');
+  let jpegB64 = null;
   if (blob && capturedCanvas) {
-    const pad = 8;
-    const bx = Math.max(0, blob.minX - pad);
-    const by = Math.max(0, blob.minY - pad);
-    const bw = Math.min(capturedCanvas.width, blob.maxX + pad) - bx;
-    const bh = Math.min(capturedCanvas.height, blob.maxY + pad) - by;
-    const tmp = document.createElement('canvas');
-    tmp.width = bw; tmp.height = bh;
-    tmp.getContext('2d').drawImage(capturedCanvas, bx, by, bw, bh, 0, 0, bw, bh);
-    blobImg.src = tmp.toDataURL('image/jpeg', 0.8);
+    jpegB64 = blobToBase64(blob);
+    blobImg.src = `data:image/jpeg;base64,${jpegB64}`;
   } else {
     blobImg.src = '';
   }
 
-  // Sort by color distance + remaining need
+  // Score by color distance + remaining need
   if (blob) {
     const { avgR, avgG, avgB } = blob;
-    uniqueParts = uniqueParts.map((p) => {
+    pickerParts = pickerParts.map((p) => {
       const key = `${p.partNum}_${p.color.id}`;
       const [pr, pg, pb] = hexToRGB(p.color.rgb);
       const dist = colorDist(avgR, avgG, avgB, pr, pg, pb);
       const have = window.lostbricks.getHave(key);
       const remaining = Math.max(0, p.qty - have);
-      // Lower score = better match. Color distance dominates, remaining breaks ties.
-      // Normalize color dist (0-441 range) and remaining (invert: more remaining = lower score)
       const score = dist - remaining * 2;
-      return { ...p, dist, remaining, score };
+      return { ...p, dist, remaining, score, mlBoost: 0 };
     }).sort((a, b) => a.score - b.score);
-
-    document.getElementById('picker-title').textContent =
-      `Pick a part (color + need)`;
   }
 
-  grid.innerHTML = uniqueParts.map((p) => {
+  // Build color chips + render immediately (before ML results)
+  buildColorChips();
+  renderPickerGrid();
+  document.getElementById('picker-colors').scrollLeft = 0;
+
+  // Ask server for ML suggestions (async — updates grid when ready)
+  if (jpegB64) {
+    const setNum = window.lostbricks.getCurrentSetNum();
+    apiSuggest(setNum, jpegB64).then((suggestions) => {
+      if (suggestions.length === 0) return;
+      // Apply ML boost to matching parts
+      const boostMap = new Map();
+      suggestions.forEach((s, i) => {
+        // Top suggestion gets biggest boost, decaying
+        boostMap.set(s.key, 100 - i * 8);
+      });
+      for (const p of pickerParts) {
+        const key = `${p.partNum}_${p.color.id}`;
+        const boost = boostMap.get(key);
+        if (boost) {
+          p.mlBoost = boost;
+          p.score -= boost; // lower score = better
+        }
+      }
+      pickerParts.sort((a, b) => a.score - b.score);
+      // Re-render with updated rankings
+      buildColorChips();
+      renderPickerGrid();
+      console.log(`ML suggest: ${suggestions.length} matches, top=${suggestions[0].key}`);
+    });
+  }
+
+  document.getElementById('picker-title').textContent = 'Pick a part';
+  document.getElementById('part-picker').classList.remove('hidden');
+}
+
+function renderPickerGrid() {
+  const grid = document.getElementById('picker-grid');
+  let filtered = pickerParts;
+  if (pickerColorFilter !== null) {
+    filtered = pickerParts.filter((p) => p.color.id === pickerColorFilter);
+  }
+
+  grid.innerHTML = filtered.map((p) => {
     const key = `${p.partNum}_${p.color.id}`;
+    const remaining = p.remaining !== undefined ? p.remaining : '';
     return `
       <div class="picker-item" data-key="${key}" data-name="${p.name}">
         <img src="${p.imgUrl || ''}" alt="" loading="lazy">
-        <div class="picker-label">${p.name}</div>
+        <div class="picker-label">${p.name}${remaining ? ` (${remaining})` : ''}</div>
       </div>
     `;
   }).join('');
@@ -442,7 +559,6 @@ function showPartPicker(blob) {
   });
 
   grid.scrollTop = 0;
-  document.getElementById('part-picker').classList.remove('hidden');
 }
 
 function hidePartPicker() {
@@ -458,20 +574,17 @@ async function assignPart(key, name) {
 
   window.lostbricks.incrementPart(key);
 
-  // Store crop
+  // Store crop locally + send to learning server
   const [partNum, colorId] = key.split('_');
+  const jpegB64 = blobToBase64(blob);
+
+  // Send to server (fire-and-forget)
+  apiLabel(window.lostbricks.getCurrentSetNum(), partNum, colorId, jpegB64);
+
+  // Also store in IndexedDB
   try {
-    const pad = 8;
-    const x = Math.max(0, blob.minX - pad);
-    const y = Math.max(0, blob.minY - pad);
-    const w = Math.min(capturedCanvas.width, blob.maxX + pad) - x;
-    const h = Math.min(capturedCanvas.height, blob.maxY + pad) - y;
-    const cropCanvas = document.createElement('canvas');
-    cropCanvas.width = w;
-    cropCanvas.height = h;
-    cropCanvas.getContext('2d').drawImage(capturedCanvas, x, y, w, h, 0, 0, w, h);
-    const cropBlob = await new Promise((r) => cropCanvas.toBlob(r, 'image/jpeg', 0.8));
-    await storeCrop(window.lostbricks.getCurrentSetNum(), partNum, parseInt(colorId), cropBlob);
+    const jpeg = await fetch(`data:image/jpeg;base64,${jpegB64}`).then((r) => r.blob());
+    await storeCrop(window.lostbricks.getCurrentSetNum(), partNum, parseInt(colorId), jpeg);
   } catch (e) {
     console.warn('Failed to store crop:', e);
   }
@@ -487,14 +600,184 @@ async function assignPart(key, name) {
 document.getElementById('scan-btn').addEventListener('click', openScan);
 document.getElementById('scan-close').addEventListener('click', closeScan);
 
-document.getElementById('scan-capture').addEventListener('click', () => {
-  capturedCanvas = captureFrame();
-  const detected = segmentImage(capturedCanvas);
-  if (detected.length === 0) {
-    alert('No parts detected. Make sure parts are on a white background with good lighting.');
-    return;
+// ── Crop Phase ──
+
+let rawCanvas = null; // full uncropped frame
+let cropRect = { x: 0, y: 0, w: 0, h: 0 }; // in image coords
+let cropDrag = null; // { edge, startPos, startRect }
+
+function showCrop(canvas) {
+  rawCanvas = canvas;
+  stopCamera();
+  // Default crop: 5% inset
+  const inset = 0.05;
+  cropRect = {
+    x: Math.round(canvas.width * inset),
+    y: Math.round(canvas.height * inset),
+    w: Math.round(canvas.width * (1 - 2 * inset)),
+    h: Math.round(canvas.height * (1 - 2 * inset)),
+  };
+  document.getElementById('scan-viewfinder').classList.add('hidden');
+  document.getElementById('scan-crop').classList.remove('hidden');
+  drawCrop();
+}
+
+function drawCrop() {
+  const canvas = document.getElementById('crop-canvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width = rawCanvas.width;
+  canvas.height = rawCanvas.height;
+
+  // Draw dimmed full image
+  ctx.drawImage(rawCanvas, 0, 0);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Draw bright crop region
+  const { x, y, w, h } = cropRect;
+  ctx.drawImage(rawCanvas, x, y, w, h, x, y, w, h);
+
+  // Draw crop border
+  ctx.strokeStyle = '#e94560';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(x, y, w, h);
+
+  // Draw corner handles
+  const hs = 20;
+  ctx.fillStyle = '#e94560';
+  for (const [cx, cy] of [[x, y], [x + w, y], [x, y + h], [x + w, y + h]]) {
+    ctx.fillRect(cx - hs / 2, cy - hs / 2, hs, hs);
   }
+}
+
+function getCropEdge(px, py) {
+  const { x, y, w, h } = cropRect;
+  const margin = 40; // touch target size in image coords
+  const canvas = document.getElementById('crop-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const scale = canvas.width / rect.width;
+  const m = margin * scale;
+
+  // Check corners first
+  if (Math.abs(px - x) < m && Math.abs(py - y) < m) return 'tl';
+  if (Math.abs(px - (x + w)) < m && Math.abs(py - y) < m) return 'tr';
+  if (Math.abs(px - x) < m && Math.abs(py - (y + h)) < m) return 'bl';
+  if (Math.abs(px - (x + w)) < m && Math.abs(py - (y + h)) < m) return 'br';
+  // Check edges
+  if (Math.abs(px - x) < m && py > y && py < y + h) return 'l';
+  if (Math.abs(px - (x + w)) < m && py > y && py < y + h) return 'r';
+  if (Math.abs(py - y) < m && px > x && px < x + w) return 't';
+  if (Math.abs(py - (y + h)) < m && px > x && px < x + w) return 'b';
+  // Inside = move whole rect
+  if (px > x && px < x + w && py > y && py < y + h) return 'move';
+  return null;
+}
+
+function getCropCanvasPos(e) {
+  const canvas = document.getElementById('crop-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  let cx, cy;
+  if (e.touches) { cx = e.touches[0].clientX; cy = e.touches[0].clientY; }
+  else { cx = e.clientX; cy = e.clientY; }
+  return { x: (cx - rect.left) * scaleX, y: (cy - rect.top) * scaleY };
+}
+
+const cropCanvas = document.getElementById('crop-canvas');
+
+cropCanvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const pos = getCropCanvasPos(e);
+  const edge = getCropEdge(pos.x, pos.y);
+  if (!edge) return;
+  cropDrag = { edge, startX: pos.x, startY: pos.y, startRect: { ...cropRect } };
+});
+
+cropCanvas.addEventListener('pointermove', (e) => {
+  if (!cropDrag) return;
+  e.preventDefault();
+  const pos = getCropCanvasPos(e);
+  const dx = pos.x - cropDrag.startX;
+  const dy = pos.y - cropDrag.startY;
+  const s = cropDrag.startRect;
+  const minSize = 100;
+
+  switch (cropDrag.edge) {
+    case 'move':
+      cropRect.x = Math.max(0, Math.min(rawCanvas.width - s.w, s.x + dx));
+      cropRect.y = Math.max(0, Math.min(rawCanvas.height - s.h, s.y + dy));
+      break;
+    case 'tl':
+      cropRect.x = Math.min(s.x + dx, s.x + s.w - minSize);
+      cropRect.y = Math.min(s.y + dy, s.y + s.h - minSize);
+      cropRect.w = s.w - (cropRect.x - s.x);
+      cropRect.h = s.h - (cropRect.y - s.y);
+      break;
+    case 'tr':
+      cropRect.w = Math.max(minSize, s.w + dx);
+      cropRect.y = Math.min(s.y + dy, s.y + s.h - minSize);
+      cropRect.h = s.h - (cropRect.y - s.y);
+      break;
+    case 'bl':
+      cropRect.x = Math.min(s.x + dx, s.x + s.w - minSize);
+      cropRect.w = s.w - (cropRect.x - s.x);
+      cropRect.h = Math.max(minSize, s.h + dy);
+      break;
+    case 'br':
+      cropRect.w = Math.max(minSize, s.w + dx);
+      cropRect.h = Math.max(minSize, s.h + dy);
+      break;
+    case 'l':
+      cropRect.x = Math.min(s.x + dx, s.x + s.w - minSize);
+      cropRect.w = s.w - (cropRect.x - s.x);
+      break;
+    case 'r':
+      cropRect.w = Math.max(minSize, s.w + dx);
+      break;
+    case 't':
+      cropRect.y = Math.min(s.y + dy, s.y + s.h - minSize);
+      cropRect.h = s.h - (cropRect.y - s.y);
+      break;
+    case 'b':
+      cropRect.h = Math.max(minSize, s.h + dy);
+      break;
+  }
+
+  // Clamp to canvas bounds
+  cropRect.x = Math.max(0, cropRect.x);
+  cropRect.y = Math.max(0, cropRect.y);
+  cropRect.w = Math.min(cropRect.w, rawCanvas.width - cropRect.x);
+  cropRect.h = Math.min(cropRect.h, rawCanvas.height - cropRect.y);
+
+  drawCrop();
+});
+
+cropCanvas.addEventListener('pointerup', () => { cropDrag = null; });
+
+document.getElementById('crop-confirm').addEventListener('click', () => {
+  // Crop the raw canvas
+  const { x, y, w, h } = cropRect;
+  capturedCanvas = document.createElement('canvas');
+  capturedCanvas.width = Math.round(w);
+  capturedCanvas.height = Math.round(h);
+  capturedCanvas.getContext('2d').drawImage(rawCanvas, Math.round(x), Math.round(y), Math.round(w), Math.round(h), 0, 0, Math.round(w), Math.round(h));
+
+  const detected = segmentImage(capturedCanvas);
+  document.getElementById('scan-crop').classList.add('hidden');
   showAnnotated(detected);
+});
+
+document.getElementById('crop-retake').addEventListener('click', () => {
+  document.getElementById('scan-crop').classList.add('hidden');
+  document.getElementById('scan-viewfinder').classList.remove('hidden');
+  startCamera();
+});
+
+// ── Capture & Navigation ──
+
+document.getElementById('scan-capture').addEventListener('click', () => {
+  showCrop(captureFrame());
 });
 
 document.getElementById('scan-retake').addEventListener('click', () => {

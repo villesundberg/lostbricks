@@ -127,7 +127,18 @@
           <div style="width:44px"></div>
         </div>
       </div>
-      <!-- Phase 2: Annotated photo -->
+      <!-- Phase 2: Crop -->
+      <div id="scan-crop" class="hidden">
+        <div class="scan-toolbar">
+          <button id="crop-retake" class="icon-btn">&#8592;</button>
+          <span>Drag edges to crop</span>
+          <button id="crop-confirm">Detect</button>
+        </div>
+        <div id="crop-wrap">
+          <canvas id="crop-canvas"></canvas>
+        </div>
+      </div>
+      <!-- Phase 3: Annotated photo -->
       <div id="scan-annotate" class="hidden">
         <div class="scan-toolbar">
           <button id="scan-retake" class="icon-btn">&#8592;</button>
@@ -148,6 +159,7 @@
           </div>
           <button id="picker-delete" class="icon-btn danger" title="Delete blob">&#128465;</button>
         </div>
+        <div id="picker-colors"></div>
         <div id="picker-grid"></div>
       </div>
     </div>
