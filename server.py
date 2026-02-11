@@ -8,6 +8,7 @@ import json
 import os
 import time
 import io
+import random
 import threading
 import urllib.request
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
 from sklearn.svm import SVC
@@ -30,6 +32,7 @@ CATALOG_DIR = Path(__file__).parent / 'data' / 'catalog'
 STATE_FILE = Path(__file__).parent / 'data' / 'state.json'
 FLAGS_FILE = Path(__file__).parent / 'data' / 'flags.json'
 SESSION_DIR = Path(__file__).parent / 'data' / 'sessions'
+FINETUNE_PATH = Path(__file__).parent / 'data' / 'model' / 'finetuned.pth'
 SAT_THRESHOLD = 0.15  # saturation threshold for foreground recovery
 
 # ── In-memory index ──
@@ -51,11 +54,15 @@ cnn_model = None
 cnn_preprocess = None
 
 def load_cnn():
-    """Load MobileNetV3-Small as feature extractor (576-dim embeddings)."""
+    """Load MobileNetV3-Small as feature extractor (576-dim embeddings).
+    Uses fine-tuned weights if available."""
     global cnn_model, cnn_preprocess
     print('Loading MobileNetV3-Small...')
     model = models.mobilenet_v3_small(weights='DEFAULT')
     model.classifier = torch.nn.Identity()  # remove classification head → 576-dim
+    if FINETUNE_PATH.exists():
+        model.load_state_dict(torch.load(FINETUNE_PATH, weights_only=True))
+        print('  loaded fine-tuned weights')
     model.eval()
     cnn_model = model
     cnn_preprocess = transforms.Compose([
@@ -88,6 +95,167 @@ def load_or_compute_vec(filepath):
     vec = img_to_vec(Path(filepath).read_bytes())
     np.save(cache_path, vec)
     return vec
+
+
+# ── Fine-tuning ──
+
+finetune_status = {'running': False, 'epoch': 0, 'total_epochs': 0, 'loss': 0.0}
+
+def fine_tune(epochs=30):
+    """Fine-tune MobileNetV3 with triplet loss on labeled crops."""
+    global cnn_model, finetune_status
+
+    finetune_status = {'running': True, 'epoch': 0, 'total_epochs': epochs, 'loss': 0.0}
+
+    # Collect all image paths grouped by key
+    key_paths = {}
+    with index_lock:
+        for set_num, entries in index.items():
+            for e in entries:
+                key = e['key']
+                if key not in key_paths:
+                    key_paths[key] = []
+                key_paths[key].append(e['path'])
+
+    all_keys = list(key_paths.keys())
+    n_classes = len(all_keys)
+    n_images = sum(len(v) for v in key_paths.values())
+    print(f'Fine-tuning: {n_images} images, {n_classes} classes')
+
+    if n_classes < 10:
+        print('  too few classes, skipping')
+        finetune_status = {'running': False, 'epoch': 0, 'total_epochs': 0, 'loss': 0.0}
+        return
+
+    # Build model from pretrained (not current fine-tuned — start fresh)
+    model = models.mobilenet_v3_small(weights='DEFAULT')
+    model.classifier = torch.nn.Identity()
+
+    # Freeze early layers, fine-tune last 4 blocks
+    for param in model.features[:8].parameters():
+        param.requires_grad = False
+
+    model.train()
+
+    # Training augmentation
+    train_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomResizedCrop(224, scale=(0.65, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=1e-4, weight_decay=1e-4,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    margin = 0.3
+    P = min(32, n_classes)  # classes per batch
+    K = 2  # images per class
+
+    for epoch in range(epochs):
+        # PK sampling: P random classes, K images each (augmented)
+        batch_keys = random.sample(all_keys, P)
+        tensors = []
+        labels = []
+        for i, key in enumerate(batch_keys):
+            paths = key_paths[key]
+            sampled = random.choices(paths, k=K)  # repeat if < K
+            for path in sampled:
+                try:
+                    img = Image.open(path).convert('RGB')
+                    tensors.append(train_transform(img))
+                    labels.append(i)
+                except Exception:
+                    pass
+
+        if len(tensors) < 6:
+            continue
+
+        batch = torch.stack(tensors)
+        labels_t = torch.tensor(labels)
+        bs = len(labels)
+
+        # Forward
+        features = model(batch)
+        features = F.normalize(features, dim=1)
+
+        # Vectorized batch-all triplet loss
+        dist_matrix = torch.cdist(features, features, p=2)
+
+        labels_eq = labels_t.unsqueeze(0) == labels_t.unsqueeze(1)  # [bs, bs]
+        # Valid anchors-positive pairs: same class, different index
+        ap_mask = labels_eq & ~torch.eye(bs, dtype=torch.bool)
+        # Valid negatives: different class
+        an_mask = ~labels_eq
+
+        # Expand to [bs, bs, bs] for (anchor, positive, negative) triplets
+        valid = ap_mask.unsqueeze(2) & an_mask.unsqueeze(1)
+
+        ap_dist = dist_matrix.unsqueeze(2)  # [bs, bs, 1]
+        an_dist = dist_matrix.unsqueeze(1)  # [bs, 1, bs]
+        triplet_loss = F.relu(ap_dist - an_dist + margin)
+
+        # Only count valid triplets with positive loss
+        active = (triplet_loss > 0) & valid
+        n_active = active.sum().item()
+
+        if n_active > 0:
+            loss = (triplet_loss * valid.float()).sum() / max(1, valid.sum().item())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_val = loss.item()
+        else:
+            loss_val = 0.0
+
+        scheduler.step()
+        finetune_status['epoch'] = epoch + 1
+        finetune_status['loss'] = round(loss_val, 4)
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f'  epoch {epoch+1}/{epochs}: loss={loss_val:.4f}, active={n_active}')
+
+    # Save fine-tuned model
+    FINETUNE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), FINETUNE_PATH)
+    print(f'  model saved to {FINETUNE_PATH}')
+
+    # Switch to fine-tuned model
+    model.eval()
+    cnn_model = model
+
+    # Delete all cached embeddings
+    deleted = 0
+    for d in [CROP_DIR, CATALOG_DIR]:
+        if d.exists():
+            for f in d.rglob('*.vec.npy'):
+                f.unlink()
+                deleted += 1
+    print(f'  deleted {deleted} cached embeddings')
+
+    # Recompute all embeddings
+    print('  recomputing embeddings...')
+    recomputed = 0
+    with index_lock:
+        for set_num in index:
+            for e in index[set_num]:
+                try:
+                    vec = img_to_vec(Path(e['path']).read_bytes())
+                    np.save(str(e['path']) + '.vec.npy', vec)
+                    e['vec'] = vec
+                    recomputed += 1
+                except Exception as ex:
+                    print(f'    skip {e["path"]}: {ex}')
+    print(f'  recomputed {recomputed} embeddings')
+
+    finetune_status = {'running': False, 'epoch': epochs, 'total_epochs': epochs, 'loss': finetune_status['loss']}
+    print('Fine-tuning complete!')
 
 
 # ── Color Classifier ──
@@ -443,6 +611,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         if self.path == '/api/state':
             self.handle_get_state()
+        elif self.path == '/api/finetune':
+            self.json_response(finetune_status)
         elif self.path.startswith('/api/learned/'):
             self.handle_get_learned()
         elif self.path.startswith('/api/debug/'):
@@ -475,6 +645,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.handle_delete_crop()
         elif self.path == '/api/bootstrap':
             self.handle_bootstrap()
+        elif self.path == '/api/finetune':
+            self.handle_finetune()
         else:
             self.send_error(404)
 
@@ -991,6 +1163,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             print(f'  bootstrap error: {e}')
             self.json_response({'error': str(e)}, 400)
+
+    def handle_finetune(self):
+        """Trigger fine-tuning in background."""
+        if finetune_status.get('running'):
+            self.json_response({'ok': False, 'error': 'already running', **finetune_status})
+            return
+        try:
+            data = json.loads(self.read_body())
+            epochs = data.get('epochs', 30)
+        except Exception:
+            epochs = 30
+        self.json_response({'ok': True, 'message': f'fine-tuning started ({epochs} epochs)'})
+        threading.Thread(target=fine_tune, args=(epochs,), daemon=True).start()
 
     def handle_flag(self):
         """Flag a crop for review."""

@@ -21,6 +21,7 @@ h1 { margin-bottom: 8px; }
 .card.flagged { border-color: #f1c40f; }
 .card-top { display: flex; gap: 10px; margin-bottom: 8px; }
 .card-top img { width: 80px; height: 80px; object-fit: contain; background: #fff; border-radius: 6px; flex-shrink: 0; }
+.card-top .catalog-img { border: 2px solid #2a2a4a; }
 .card-info { flex: 1; min-width: 0; }
 .card-label { font-weight: 600; font-size: 0.85rem; margin-bottom: 4px; }
 .card-label .key { color: #888; font-weight: 400; }
@@ -148,6 +149,34 @@ h1 { margin-bottom: 8px; }
 .stat-line { font-size: 0.8rem; color: #aaa; }
 .stat-line strong { color: #eee; }
 
+/* Relabel grid */
+.relabel-grid {
+  max-height: 300px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #0a0a1a;
+  border-radius: 6px;
+  padding: 6px;
+}
+.relabel-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-size: 0.75rem;
+}
+.relabel-item:hover { background: rgba(255,255,255,0.05); border-color: #2a2a4a; }
+.relabel-item.current { opacity: 0.4; cursor: default; }
+.relabel-item img { width: 40px; height: 40px; object-fit: contain; background: #fff; border-radius: 4px; flex-shrink: 0; }
+.relabel-item .ri-swatch { width: 12px; height: 12px; border-radius: 2px; border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0; }
+.relabel-item .ri-key { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.relabel-item .ri-dist { color: #666; flex-shrink: 0; }
+
 /* Histogram */
 .histogram-wrap {
   display: flex;
@@ -215,6 +244,12 @@ h1 { margin-bottom: 8px; }
           </div>
         </div>
 
+        <!-- Catalog reference image -->
+        <div class="sidebar-section">
+          <label>Catalog reference</label>
+          <img id="inspector-catalog-img" style="width:100%;max-width:120px;background:#fff;border-radius:6px;border:2px solid #2a2a4a" alt="">
+        </div>
+
         <!-- Average color from mask -->
         <div class="sidebar-section">
           <label>Avg color (foreground pixels)</label>
@@ -256,11 +291,8 @@ h1 { margin-bottom: 8px; }
         <!-- Relabel -->
         <div class="sidebar-section">
           <label>Relabel this crop</label>
-          <select id="relabel-select" style="padding:6px;border-radius:4px;background:#0a0a1a;color:#eee;border:1px solid #2a2a4a;font-size:0.8rem">
-            <option value="">— pick correct label —</option>
-          </select>
+          <div id="relabel-grid" class="relabel-grid"></div>
           <div class="btn-row">
-            <button id="relabel-btn" style="border-color:#f39c12;color:#f39c12">Relabel</button>
             <button id="delete-crop-btn" style="border-color:#e94560;color:#e94560">Delete crop</button>
           </div>
         </div>
@@ -285,6 +317,7 @@ let learnedColors = {};
 let learnedThreshold = 200;
 let allKeys = [];
 let filter = 'all';
+let sortMode = 'time'; // 'time' or 'suspicious'
 
 function colorName(cid) { return LEGO_COLORS[cid]?.name || `Color ${cid}`; }
 
@@ -311,6 +344,23 @@ function render() {
   else if (filter === 'flagged') crops = crops.filter(c => c._flagged);
   else if (filter !== 'all') crops = crops.filter(c => c.colorId === filter);
 
+  if (sortMode === 'suspicious') {
+    // Sort by how much the classifier disagrees: correct rank (higher = more suspicious)
+    // + top suggestion distance to the crop (lower = classifier is more confident it's wrong)
+    crops = [...crops].sort((a, b) => {
+      const rankA = a.suggestions.findIndex(s => s.key === a.key);
+      const rankB = b.suggestions.findIndex(s => s.key === b.key);
+      // -1 means not in top 5 → most suspicious (rank 99)
+      const rA = rankA < 0 ? 99 : rankA;
+      const rB = rankB < 0 ? 99 : rankB;
+      if (rA !== rB) return rB - rA; // higher rank = more suspicious first
+      // Tiebreak: lower top-1 distance = classifier is more confident
+      const dA = a.suggestions[0]?.dist || 0;
+      const dB = b.suggestions[0]?.dist || 0;
+      return dA - dB;
+    });
+  }
+
   grid.innerHTML = crops.map((c) => {
     const imgSrc = c.path;
     const partKey = c.key;
@@ -333,9 +383,11 @@ function render() {
     const rankLabel = correctRank === 0 ? 'rank 1' :
       correctRank > 0 ? `rank ${correctRank + 1}` : 'not in top 5';
 
+    const catalogSrc = `data/catalog/${SET_NUM}/${partKey}.jpg`;
     return `<div class="card ${isWrong ? 'wrong' : ''} ${c._flagged ? 'flagged' : ''}" onclick="openInspector(${globalIdx})" data-idx="${globalIdx}">
       <div class="card-top">
         <img src="${imgSrc}" alt="" loading="lazy">
+        <img class="catalog-img" src="${catalogSrc}" alt="" loading="lazy" onerror="this.style.display='none'">
         <div class="card-info">
           <div class="card-label">
             ${partNum} <span class="key">${colorName(colorId)}</span>
@@ -371,6 +423,7 @@ function renderFilters() {
   let html = `<button class="${filter==='all'?'active':''}" onclick="setFilter('all')">All (${allCrops.length})</button>`;
   html += `<button class="${filter==='wrong'?'active':''}" onclick="setFilter('wrong')">Wrong (${wrongCount})</button>`;
   if (flagCount) html += `<button class="${filter==='flagged'?'active':''}" onclick="setFilter('flagged')">Flagged (${flagCount})</button>`;
+  html += `<button class="${sortMode==='suspicious'?'active':''}" onclick="toggleSort()" style="margin-left:auto">⚠ Most suspicious</button>`;
 
   const sorted = Object.entries(colorCounts).sort((a,b) => b[1]-a[1]);
   for (const [cid, cnt] of sorted) {
@@ -384,6 +437,12 @@ function renderFilters() {
 
 function setFilter(f) {
   filter = f;
+  renderFilters();
+  render();
+}
+
+function toggleSort() {
+  sortMode = sortMode === 'suspicious' ? 'time' : 'suspicious';
   renderFilters();
   render();
 }
@@ -439,6 +498,8 @@ function openInspector(cropIdx) {
   const [partNum, colorId] = crop.key.split('_');
   document.getElementById('inspector-title').textContent =
     `${partNum} — ${colorName(colorId)}`;
+  document.getElementById('inspector-catalog-img').src =
+    `data/catalog/${SET_NUM}/${crop.key}.jpg`;
 
   // Show learned color for comparison
   const lc = learnedColors[colorId];
@@ -479,13 +540,28 @@ function openInspector(cropIdx) {
   };
   inspectorImg.src = crop.path;
 
-  // Populate relabel dropdown
-  const sel = document.getElementById('relabel-select');
-  sel.innerHTML = '<option value="">— pick correct label —</option>';
-  for (const k of allKeys) {
+  // Populate relabel grid: suggestions first, then remaining keys by name
+  const suggestionKeys = new Set(crop.suggestions.map(s => s.key));
+  const suggestionDist = {};
+  crop.suggestions.forEach(s => { suggestionDist[s.key] = s.dist; });
+  // Build sorted list: suggestions by distance, then rest alphabetically
+  const sortedKeys = [
+    ...crop.suggestions.map(s => s.key),
+    ...allKeys.filter(k => !suggestionKeys.has(k)).sort(),
+  ];
+  const grid = document.getElementById('relabel-grid');
+  grid.innerHTML = sortedKeys.map(k => {
     const [pn, ci] = k.split('_');
-    sel.innerHTML += `<option value="${k}" ${k === crop.key ? 'selected disabled' : ''}>${k} (${colorName(ci)})</option>`;
-  }
+    const isCurrent = k === crop.key;
+    const dist = suggestionDist[k];
+    const distLabel = dist !== undefined ? dist.toFixed(3) : '';
+    return `<div class="relabel-item ${isCurrent ? 'current' : ''}" data-key="${k}" ${isCurrent ? '' : `onclick="doRelabel('${k}')"`}>
+      <img src="data/catalog/${SET_NUM}/${k}.jpg" alt="" onerror="this.style.visibility='hidden'">
+      <span class="ri-swatch" style="background:${learnedRGB(ci)}"></span>
+      <span class="ri-key">${pn} <span style="color:#888">${colorName(ci)}</span></span>
+      <span class="ri-dist">${distLabel}</span>
+    </div>`;
+  }).join('');
 
   document.getElementById('inspector-overlay').classList.add('open');
 }
@@ -714,13 +790,8 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Relabel
-document.getElementById('relabel-btn').addEventListener('click', async () => {
-  if (!inspCropData) return;
-  const newKey = document.getElementById('relabel-select').value;
-  if (!newKey || newKey === inspCropData.key) {
-    alert('Pick a different label');
-    return;
-  }
+async function doRelabel(newKey) {
+  if (!inspCropData || newKey === inspCropData.key) return;
   const [np, nc] = newKey.split('_');
   if (!confirm(`Relabel this crop from ${inspCropData.key} to ${newKey} (${colorName(nc)})?`)) return;
 
@@ -732,11 +803,11 @@ document.getElementById('relabel-btn').addEventListener('click', async () => {
   const data = await res.json();
   if (data.ok) {
     closeInspector();
-    load(); // reload everything
+    load();
   } else {
     alert('Error: ' + (data.error || 'unknown'));
   }
-});
+}
 
 // Delete crop
 document.getElementById('delete-crop-btn').addEventListener('click', async () => {

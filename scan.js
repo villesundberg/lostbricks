@@ -747,39 +747,32 @@ function showPartPicker(blob, allowAutoAssign = false) {
         }
       }
 
-      // Apply SVM color probability × set prior (Bayesian posterior)
-      const colorProbs = result.colorProbs;
-      if (colorProbs && Object.keys(colorProbs).length > 0) {
-        // Compute posterior: P(color|blob) ∝ P(blob|color) × P(color_in_set)
-        let posteriorSum = 0;
-        const posteriors = {};
-        for (const cid of Object.keys(colorProbs)) {
-          const likelihood = colorProbs[cid];
-          const prior = colorPrior[cid] || 0.001; // small floor for unseen colors
-          posteriors[cid] = likelihood * prior;
-          posteriorSum += posteriors[cid];
+      // Derive color probabilities from k-NN results (CNN already encodes color)
+      const knnColorVotes = {};
+      for (const s of suggestions) {
+        const cid = s.key.split('_')[1];
+        const weight = 1 / (1 + s.dist);
+        knnColorVotes[cid] = (knnColorVotes[cid] || 0) + weight;
+      }
+      // Apply Bayesian prior from set composition
+      let posteriorSum = 0;
+      const posteriors = {};
+      for (const cid of Object.keys(knnColorVotes)) {
+        const likelihood = knnColorVotes[cid];
+        const prior = colorPrior[cid] || 0.001;
+        posteriors[cid] = likelihood * prior;
+        posteriorSum += posteriors[cid];
+      }
+      if (posteriorSum > 0) {
+        for (const cid of Object.keys(posteriors)) {
+          posteriors[cid] /= posteriorSum;
         }
-        // Normalize
-        if (posteriorSum > 0) {
-          for (const cid of Object.keys(posteriors)) {
-            posteriors[cid] /= posteriorSum;
-          }
-        }
-        for (const p of pickerParts) {
-          const cid = String(p.color.id);
-          const posterior = posteriors[cid] || 0;
-          p.colorProb = posterior;
-          p.score -= posterior * 150;
-        }
-      } else if (lc && blob) {
-        // Fallback: re-score with learned color averages
-        const { avgR, avgG, avgB } = blob;
-        for (const p of pickerParts) {
-          const lcEntry = lc[String(p.color.id)];
-          if (lcEntry && lcEntry.count >= 1) {
-            p.dist = colorDist(avgR, avgG, avgB, lcEntry.r, lcEntry.g, lcEntry.b);
-          }
-        }
+      }
+      for (const p of pickerParts) {
+        const cid = String(p.color.id);
+        const posterior = posteriors[cid] || 0;
+        p.colorProb = posterior;
+        p.score -= posterior * 150;
       }
       pickerParts.sort((a, b) => a.score - b.score);
 
@@ -806,9 +799,8 @@ function showPartPicker(blob, allowAutoAssign = false) {
       renderPickerGrid();
       updatePickerTitle();
       const topColorId = topKey.split('_')[1];
-      const svmP = colorProbs ? (colorProbs[topColorId] || 0).toFixed(2) : '?';
       const postP = topPart ? (topPart.colorProb || 0).toFixed(2) : '?';
-      console.log(`ML: ${cropCount} crops, top=${topKey} (d=${topDist}, gap=${gap.toFixed(3)}, svm=${svmP}, post=${postP})`);
+      console.log(`ML: ${cropCount} crops, top=${topKey} (d=${topDist}, gap=${gap.toFixed(3)}, colorPost=${postP})`);
     });
   }
 
